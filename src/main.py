@@ -73,7 +73,8 @@ def main():
     start_time = datetime.now(timezone.utc)
     invocation_count = 0
     trade_log = []  # For Sharpe: list of returns
-    active_trades = []  # {'asset','is_long','amount','entry_price','tp_oid','sl_oid','exit_plan'}
+    ACTIVE_TRADES_PATH = "active_trades.json"
+    active_trades = []  # persisted to ACTIVE_TRADES_PATH — loaded/reconciled on startup
     recent_events = deque(maxlen=200)
     diary_path = "diary.jsonl"
     initial_account_value = None
@@ -85,6 +86,14 @@ def main():
     def add_event(msg: str):
         """Log an informational event and push it into the recent events deque."""
         logging.info(msg)
+
+    def save_active_trades():
+        """Persist active_trades list to disk (H5)."""
+        try:
+            with open(ACTIVE_TRADES_PATH, "w") as f:
+                json.dump(active_trades, f, default=str)
+        except Exception as e:
+            logging.warning("Failed to save active_trades: %s", e)
 
     async def run_loop():
         """Main trading loop that gathers data, calls the agent, and executes trades."""
@@ -100,6 +109,38 @@ def main():
         for dex in hip3_dexes:
             await hyperliquid.get_meta_and_ctxs(dex=dex)
             add_event(f"Loaded HIP-3 meta for dex: {dex}")
+
+        # H5: Load persisted active_trades and reconcile against live exchange state
+        try:
+            with open(ACTIVE_TRADES_PATH, "r") as f:
+                loaded_trades = json.load(f)
+            if loaded_trades:
+                recon_state = await hyperliquid.get_user_state()
+                recon_orders = await hyperliquid.get_open_orders()
+                assets_with_pos = {
+                    p.get('coin') for p in recon_state.get('positions', [])
+                    if abs(float(p.get('szi') or 0)) > 0
+                }
+                assets_with_orders = {o.get('coin') for o in recon_orders if o.get('coin')}
+                all_live_oids = {o.get('oid') for o in recon_orders if o.get('oid')}
+                for tr in loaded_trades:
+                    asset_name = tr.get('asset')
+                    tp_oid_tr = tr.get('tp_oid')
+                    sl_oid_tr = tr.get('sl_oid')
+                    has_pos = asset_name in assets_with_pos
+                    has_orders = asset_name in assets_with_orders
+                    has_oid = (tp_oid_tr and tp_oid_tr in all_live_oids) or (sl_oid_tr and sl_oid_tr in all_live_oids)
+                    if has_pos or has_orders or has_oid:
+                        active_trades.append(tr)
+                        add_event(f"H5: Restored active trade for {asset_name} from disk")
+                    else:
+                        add_event(f"H5: Dropped stale active trade for {asset_name} (no position/orders on exchange)")
+                if active_trades:
+                    save_active_trades()
+        except FileNotFoundError:
+            add_event("H5: No active_trades.json found — starting fresh")
+        except Exception as e:
+            add_event(f"H5: Error loading active_trades: {e}")
 
         while True:
             invocation_count += 1
@@ -148,6 +189,7 @@ def main():
                         for tr in active_trades[:]:
                             if tr.get('asset') == coin:
                                 active_trades.remove(tr)
+                        save_active_trades()  # H5
                         with open(diary_path, "a") as f:
                             f.write(json.dumps({
                                 "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -210,6 +252,7 @@ def main():
                         if tr['_orphan_cycles'] >= ORPHAN_CYCLES_REQUIRED:
                             add_event(f"Reconciling stale active trade for {asset} (orphan for {tr['_orphan_cycles']} cycles)")
                             active_trades.remove(tr)
+                            save_active_trades()  # H5
                             with open(diary_path, "a") as f:
                                 f.write(json.dumps({
                                     "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -486,23 +529,61 @@ def main():
                                         }) + "\n")
                                     continue
                             else:
-                                # Opposite direction — flip not yet implemented (Phase 2 H6).
-                                # Skip to avoid ambiguous double-direction state.
-                                add_event(
-                                    f"SKIP {asset}: opposite-direction position exists "
-                                    f"(have {('long' if existing_is_long else 'short')}, "
-                                    f"want {('long' if is_buy else 'short')}). "
-                                    f"Flip handling not yet implemented."
-                                )
-                                with open(diary_path, "a") as f:
-                                    f.write(json.dumps({
-                                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                                        "asset": asset,
-                                        "action": "skip_flip_pending",
-                                        "existing_side": "long" if existing_is_long else "short",
-                                        "requested_side": "long" if is_buy else "short",
-                                    }) + "\n")
-                                continue
+                                # H6: Opposite direction — flip: close existing, then open new
+                                old_side = 'long' if existing_is_long else 'short'
+                                new_side = 'long' if is_buy else 'short'
+                                add_event(f"FLIP {asset}: closing {old_side} (notional ${existing_notional:.2f}) to open {new_side}")
+                                flip_ok = False
+                                try:
+                                    close_size = abs(existing_szi)
+                                    if existing_is_long:
+                                        await hyperliquid.place_sell_order(asset, close_size)
+                                    else:
+                                        await hyperliquid.place_buy_order(asset, close_size)
+                                    await hyperliquid.cancel_all_orders(asset)
+                                    # Poll to confirm position is closed (up to 5 × 0.5s)
+                                    for _ in range(5):
+                                        await asyncio.sleep(0.5)
+                                        check_state = await hyperliquid.get_user_state()
+                                        still_open = any(
+                                            p.get('coin') == asset and abs(float(p.get('szi') or 0)) > 0
+                                            for p in check_state.get('positions', [])
+                                        )
+                                        if not still_open:
+                                            flip_ok = True
+                                            break
+                                    if not flip_ok:
+                                        add_event(f"FLIP {asset}: position still open after close — skipping new entry this cycle")
+                                        with open(diary_path, "a") as f:
+                                            f.write(json.dumps({
+                                                "timestamp": datetime.now(timezone.utc).isoformat(),
+                                                "asset": asset,
+                                                "action": "flip_close_timeout",
+                                                "old_side": old_side,
+                                                "new_side": new_side,
+                                            }) + "\n")
+                                        continue
+                                    # Remove stale active_trade entry
+                                    for tr in active_trades[:]:
+                                        if tr.get('asset') == asset:
+                                            active_trades.remove(tr)
+                                    save_active_trades()  # H5
+                                    with open(diary_path, "a") as f:
+                                        f.write(json.dumps({
+                                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                                            "asset": asset,
+                                            "action": "flip_closed",
+                                            "old_side": old_side,
+                                            "new_side": new_side,
+                                            "closed_size": close_size,
+                                        }) + "\n")
+                                    add_event(f"FLIP {asset}: {old_side} closed — proceeding to open {new_side}")
+                                    # Fall through: proceed to open the new direction below
+                                except Exception as flip_err:
+                                    add_event(f"FLIP {asset}: close failed ({flip_err}) — skipping new entry")
+                                    continue
+                                if not flip_ok:
+                                    continue
 
                         # --- RISK: Validate trade before execution ---
                         output["current_price"] = current_price
@@ -543,72 +624,121 @@ def main():
                         else:
                             order = await hyperliquid.place_buy_order(asset, amount) if is_buy else await hyperliquid.place_sell_order(asset, amount)
 
-                        # Confirm by checking recent fills for this asset shortly after placing
-                        await asyncio.sleep(1)
-                        fills_check = await hyperliquid.get_recent_fills(limit=10)
+                        # H7/M9: Poll actual filled position size — HIP-3 gets more polls
+                        actual_size = amount
                         filled = False
-                        for fc in reversed(fills_check):
+                        max_polls = 5 if ":" in asset else 3
+                        poll_delay = 0.5 if ":" in asset else 0.35
+                        for _poll in range(max_polls):
+                            await asyncio.sleep(poll_delay)
                             try:
-                                if (fc.get('coin') == asset or fc.get('asset') == asset):
-                                    filled = True
-                                    break
+                                pos_state = await hyperliquid.get_user_state()
+                                for _p in pos_state.get('positions', []):
+                                    if _p.get('coin') == asset:
+                                        _szi = abs(float(_p.get('szi') or 0))
+                                        if _szi > 0:
+                                            actual_size = _szi
+                                            filled = True
+                                            break
                             except Exception:
-                                continue
-                        trade_log.append({"type": action, "price": current_price, "amount": amount, "exit_plan": output["exit_plan"], "filled": filled})
+                                pass
+                            if filled:
+                                break
+                        if not filled:
+                            # Fallback: check recent fills
+                            fills_check = await hyperliquid.get_recent_fills(limit=10)
+                            for fc in reversed(fills_check):
+                                try:
+                                    if fc.get('coin') == asset or fc.get('asset') == asset:
+                                        filled = True
+                                        break
+                                except Exception:
+                                    continue
+                        add_event(f"{action.upper()} {asset} amount {actual_size:.6f} at ~{current_price} (filled={filled})")
+
+                        trade_log.append({"type": action, "price": current_price, "amount": actual_size, "exit_plan": output["exit_plan"], "filled": filled})
+
+                        # H8: Place TP and SL — only register in active_trades when both succeed
                         tp_oid = None
                         sl_oid = None
-                        if output.get("tp_price"):
-                            tp_order = await hyperliquid.place_take_profit(asset, is_buy, amount, output["tp_price"])
-                            tp_oids = hyperliquid.extract_oids(tp_order)
-                            tp_oid = tp_oids[0] if tp_oids else None
-                            add_event(f"TP placed {asset} at {output['tp_price']}")
-                        if output.get("sl_price"):
-                            sl_order = await hyperliquid.place_stop_loss(asset, is_buy, amount, output["sl_price"])
-                            sl_oids = hyperliquid.extract_oids(sl_order)
-                            sl_oid = sl_oids[0] if sl_oids else None
-                            add_event(f"SL placed {asset} at {output['sl_price']}")
-                        # Reconcile: if opposite-side position exists or TP/SL just filled, clear stale active_trades for this asset
-                        for existing in active_trades[:]:
-                            if existing.get('asset') == asset:
-                                try:
-                                    active_trades.remove(existing)
-                                except ValueError:
-                                    pass
-                        active_trades.append({
-                            "asset": asset,
-                            "is_long": is_buy,
-                            "amount": amount,
-                            "entry_price": current_price,
-                            "tp_oid": tp_oid,
-                            "sl_oid": sl_oid,
-                            "exit_plan": output["exit_plan"],
-                            "opened_at": datetime.now().isoformat()
-                        })
-                        add_event(f"{action.upper()} {asset} amount {amount:.4f} at ~{current_price}")
-                        if rationale:
-                            add_event(f"Post-trade rationale for {asset}: {rationale}")
-                        # Write to diary after confirming fills status
-                        with open(diary_path, "a") as f:
-                            diary_entry = {
-                                "timestamp": datetime.now(timezone.utc).isoformat(),
+                        orders_ok = True
+                        try:
+                            if output.get("tp_price"):
+                                tp_order = await hyperliquid.place_take_profit(asset, is_buy, actual_size, output["tp_price"])
+                                tp_oids = hyperliquid.extract_oids(tp_order)
+                                tp_oid = tp_oids[0] if tp_oids else None
+                                if tp_oid is None:
+                                    add_event(f"WARNING: TP for {asset} returned no oid — response: {tp_order}")
+                                    orders_ok = False
+                                else:
+                                    add_event(f"TP placed {asset} at {output['tp_price']} (oid={tp_oid})")
+                            if output.get("sl_price"):
+                                sl_order = await hyperliquid.place_stop_loss(asset, is_buy, actual_size, output["sl_price"])
+                                sl_oids = hyperliquid.extract_oids(sl_order)
+                                sl_oid = sl_oids[0] if sl_oids else None
+                                if sl_oid is None:
+                                    add_event(f"WARNING: SL for {asset} returned no oid — response: {sl_order}")
+                                    orders_ok = False
+                                else:
+                                    add_event(f"SL placed {asset} at {output['sl_price']} (oid={sl_oid})")
+                        except Exception as tpsl_err:
+                            add_event(f"TP/SL placement error for {asset}: {tpsl_err}")
+                            orders_ok = False
+
+                        if not orders_ok:
+                            # H8: Cancel any partial orders and do NOT register the trade
+                            add_event(f"H8: TP/SL incomplete for {asset} — cancelling all orders, trade not registered")
+                            await hyperliquid.cancel_all_orders(asset)
+                            with open(diary_path, "a") as f:
+                                f.write(json.dumps({
+                                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                                    "asset": asset,
+                                    "action": "tpsl_failed",
+                                    "entry_action": action,
+                                    "tp_oid": tp_oid,
+                                    "sl_oid": sl_oid,
+                                }) + "\n")
+                        else:
+                            # All confirmed — register in active_trades and persist
+                            for existing in active_trades[:]:
+                                if existing.get('asset') == asset:
+                                    try:
+                                        active_trades.remove(existing)
+                                    except ValueError:
+                                        pass
+                            active_trades.append({
                                 "asset": asset,
-                                "action": action,
-                                "order_type": order_type,
-                                "limit_price": limit_price,
-                                "allocation_usd": alloc_usd,
-                                "amount": amount,
+                                "is_long": is_buy,
+                                "amount": actual_size,
                                 "entry_price": current_price,
-                                "tp_price": output.get("tp_price"),
                                 "tp_oid": tp_oid,
-                                "sl_price": output.get("sl_price"),
                                 "sl_oid": sl_oid,
-                                "exit_plan": output.get("exit_plan", ""),
-                                "rationale": output.get("rationale", ""),
-                                "order_result": str(order),
-                                "opened_at": datetime.now(timezone.utc).isoformat(),
-                                "filled": filled
-                            }
-                            f.write(json.dumps(diary_entry) + "\n")
+                                "exit_plan": output["exit_plan"],
+                                "opened_at": datetime.now(timezone.utc).isoformat()
+                            })
+                            save_active_trades()  # H5
+                            if rationale:
+                                add_event(f"Post-trade rationale for {asset}: {rationale}")
+                            with open(diary_path, "a") as f:
+                                f.write(json.dumps({
+                                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                                    "asset": asset,
+                                    "action": action,
+                                    "order_type": order_type,
+                                    "limit_price": limit_price,
+                                    "allocation_usd": alloc_usd,
+                                    "amount": actual_size,
+                                    "entry_price": current_price,
+                                    "tp_price": output.get("tp_price"),
+                                    "tp_oid": tp_oid,
+                                    "sl_price": output.get("sl_price"),
+                                    "sl_oid": sl_oid,
+                                    "exit_plan": output.get("exit_plan", ""),
+                                    "rationale": output.get("rationale", ""),
+                                    "order_result": str(order),
+                                    "opened_at": datetime.now(timezone.utc).isoformat(),
+                                    "filled": filled
+                                }) + "\n")
                     else:
                         add_event(f"Hold {asset}: {output.get('rationale', '')}")
                         # Write hold to diary
