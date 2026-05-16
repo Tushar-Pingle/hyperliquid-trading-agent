@@ -217,6 +217,28 @@ class RiskManager:
         if alloc_usd <= 0:
             return False, "Zero or negative allocation", trade
 
+        # S4: ATR-scaled sizing — shrink in high vol, allow more in low vol.
+        # atr_ratio = short-term ATR / long-term ATR (e.g. atr3_4h / atr14_4h).
+        try:
+            atr_ratio = float(trade.get("atr_ratio") or 0)
+        except (TypeError, ValueError):
+            atr_ratio = 0
+        if atr_ratio > 0:
+            if atr_ratio > 1.5:
+                scale = 0.7
+            elif atr_ratio < 0.7:
+                scale = 1.2
+            else:
+                scale = 1.0
+            if scale != 1.0:
+                new_alloc = alloc_usd * scale
+                logging.info(
+                    "RISK S4: atr_ratio=%.2f → scaling alloc $%.2f × %.2f = $%.2f",
+                    atr_ratio, alloc_usd, scale, new_alloc
+                )
+                alloc_usd = new_alloc
+                trade = {**trade, "allocation_usd": alloc_usd}
+
         # Hyperliquid minimum order size is $10
         if alloc_usd < 11.0:
             alloc_usd = 11.0
