@@ -187,29 +187,44 @@ def main():
             except Exception:
                 open_orders = []
 
-            # Reconcile active trades
+            # Reconcile active trades — C3: require 2 consecutive cycles of
+            # "no position AND no orders" before purging, to avoid false
+            # closures caused by cancel-fetch race conditions.
             try:
+                # Positions: only count those with notional > $0.01 (filters dust).
                 assets_with_positions = set()
                 for pos in state['positions']:
                     try:
-                        if abs(float(pos.get('szi') or 0)) > 0:
+                        szi = abs(float(pos.get('szi') or 0))
+                        entry = float(pos.get('entryPx') or 0)
+                        if szi > 0 and szi * entry > 0.01:
                             assets_with_positions.add(pos.get('coin'))
                     except Exception:
                         continue
                 assets_with_orders = {o.get('coin') for o in (open_orders or []) if o.get('coin')}
+                ORPHAN_CYCLES_REQUIRED = 2
                 for tr in active_trades[:]:
                     asset = tr.get('asset')
                     if asset not in assets_with_positions and asset not in assets_with_orders:
-                        add_event(f"Reconciling stale active trade for {asset} (no position, no orders)")
-                        active_trades.remove(tr)
-                        with open(diary_path, "a") as f:
-                            f.write(json.dumps({
-                                "timestamp": datetime.now(timezone.utc).isoformat(),
-                                "asset": asset,
-                                "action": "reconcile_close",
-                                "reason": "no_position_no_orders",
-                                "opened_at": tr.get('opened_at')
-                            }) + "\n")
+                        tr['_orphan_cycles'] = tr.get('_orphan_cycles', 0) + 1
+                        if tr['_orphan_cycles'] >= ORPHAN_CYCLES_REQUIRED:
+                            add_event(f"Reconciling stale active trade for {asset} (orphan for {tr['_orphan_cycles']} cycles)")
+                            active_trades.remove(tr)
+                            with open(diary_path, "a") as f:
+                                f.write(json.dumps({
+                                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                                    "asset": asset,
+                                    "action": "reconcile_close",
+                                    "reason": "no_position_no_orders",
+                                    "orphan_cycles": tr['_orphan_cycles'],
+                                    "opened_at": tr.get('opened_at')
+                                }) + "\n")
+                        else:
+                            add_event(f"Tentative orphan for {asset} (cycle {tr['_orphan_cycles']}/{ORPHAN_CYCLES_REQUIRED}) — deferring reconcile")
+                    else:
+                        # Reset counter if the asset reappears on exchange
+                        if tr.get('_orphan_cycles', 0) > 0:
+                            tr['_orphan_cycles'] = 0
             except Exception:
                 pass
 
@@ -433,6 +448,61 @@ def main():
                         if alloc_usd <= 0:
                             add_event(f"Holding {asset}: zero/negative allocation")
                             continue
+
+                        # --- C1: Pre-trade position-existence check ---
+                        # Prevents stacking: if a same-direction position already
+                        # exists with comparable notional, skip the trade. If an
+                        # opposite-direction position exists, skip and log
+                        # (flip handling is a separate, deliberate operation).
+                        existing_szi = 0.0
+                        existing_entry = 0.0
+                        for pos in state.get('positions', []):
+                            if pos.get('coin') == asset:
+                                try:
+                                    existing_szi = float(pos.get('szi') or 0)
+                                    existing_entry = float(pos.get('entryPx') or 0)
+                                except (TypeError, ValueError):
+                                    existing_szi = 0.0
+                                break
+                        if existing_szi != 0:
+                            existing_is_long = existing_szi > 0
+                            existing_notional = abs(existing_szi) * (existing_entry or current_price)
+                            if existing_is_long == is_buy:
+                                # Same direction — only allow add if existing notional
+                                # is < 50% of requested allocation (true scale-in case).
+                                if existing_notional >= alloc_usd * 0.5:
+                                    add_event(
+                                        f"SKIP {asset}: already at target — "
+                                        f"existing {('long' if existing_is_long else 'short')} "
+                                        f"notional ${existing_notional:.2f} vs requested ${alloc_usd:.2f}"
+                                    )
+                                    with open(diary_path, "a") as f:
+                                        f.write(json.dumps({
+                                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                                            "asset": asset,
+                                            "action": "skip_already_open",
+                                            "existing_notional": existing_notional,
+                                            "requested_alloc_usd": alloc_usd,
+                                        }) + "\n")
+                                    continue
+                            else:
+                                # Opposite direction — flip not yet implemented (Phase 2 H6).
+                                # Skip to avoid ambiguous double-direction state.
+                                add_event(
+                                    f"SKIP {asset}: opposite-direction position exists "
+                                    f"(have {('long' if existing_is_long else 'short')}, "
+                                    f"want {('long' if is_buy else 'short')}). "
+                                    f"Flip handling not yet implemented."
+                                )
+                                with open(diary_path, "a") as f:
+                                    f.write(json.dumps({
+                                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                                        "asset": asset,
+                                        "action": "skip_flip_pending",
+                                        "existing_side": "long" if existing_is_long else "short",
+                                        "requested_side": "long" if is_buy else "short",
+                                    }) + "\n")
+                                continue
 
                         # --- RISK: Validate trade before execution ---
                         output["current_price"] = current_price

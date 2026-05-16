@@ -294,19 +294,55 @@ class HyperliquidAPI:
         """
         return await self._retry(lambda: self.exchange.cancel(asset, oid))
 
-    async def cancel_all_orders(self, asset):
-        """Cancel every open order for ``asset`` owned by the configured wallet."""
-        try:
-            open_orders = await self._retry(lambda: self.info.frontend_open_orders(self.query_address))
-            for order in open_orders:
-                if order.get("coin") == asset:
-                    oid = order.get("oid")
-                    if oid:
+    async def cancel_all_orders(self, asset, max_attempts: int = 3, poll_delay: float = 0.2):
+        """Cancel every open order for ``asset`` and verify by polling.
+
+        Some order types (notably UI-set position-attached TP/SL with
+        ``tpsl="tp"/"sl"``) may not appear immediately in the
+        frontend_open_orders feed. This retries up to ``max_attempts`` times
+        with a short delay so stale triggers don't linger after we move on.
+        """
+        total_cancelled = 0
+        last_remaining = 0
+        for attempt in range(max_attempts):
+            try:
+                open_orders = await self._retry(
+                    lambda: self.info.frontend_open_orders(self.query_address)
+                )
+            except (RuntimeError, ValueError, KeyError, ConnectionError) as e:
+                logging.error("cancel_all_orders fetch failed for %s: %s", asset, e)
+                return {"status": "error", "message": str(e), "cancelled_count": total_cancelled}
+
+            asset_orders = [o for o in open_orders if o.get("coin") == asset]
+            if not asset_orders:
+                if attempt > 0:
+                    logging.info(
+                        "cancel_all_orders %s: clean after %d attempt(s)",
+                        asset, attempt + 1
+                    )
+                return {"status": "ok", "cancelled_count": total_cancelled, "attempts": attempt + 1}
+
+            last_remaining = len(asset_orders)
+            for order in asset_orders:
+                oid = order.get("oid")
+                if oid:
+                    try:
                         await self.cancel_order(asset, oid)
-            return {"status": "ok", "cancelled_count": len([o for o in open_orders if o.get("coin") == asset])}
-        except (RuntimeError, ValueError, KeyError, ConnectionError) as e:
-            logging.error("Cancel all orders error for %s: %s", asset, e)
-            return {"status": "error", "message": str(e)}
+                        total_cancelled += 1
+                    except Exception as e:
+                        logging.warning("Failed to cancel %s oid %s: %s", asset, oid, e)
+            await asyncio.sleep(poll_delay)
+
+        logging.warning(
+            "cancel_all_orders %s: %d order(s) still remain after %d attempts",
+            asset, last_remaining, max_attempts
+        )
+        return {
+            "status": "partial",
+            "cancelled_count": total_cancelled,
+            "remaining": last_remaining,
+            "attempts": max_attempts,
+        }
 
     async def get_open_orders(self):
         """Fetch and normalize open orders associated with the wallet.
@@ -379,16 +415,25 @@ class HyperliquidAPI:
     async def get_user_state(self):
         """Retrieve wallet state with enriched position PnL calculations.
 
-        Supports both standard and unified accounts. For unified accounts,
-        the available balance comes from the spot clearinghouse (USDC total).
+        Supports both standard and unified accounts.
 
         Returns:
-            Dictionary with ``balance``, ``total_value``, and ``positions``.
+            Dictionary with keys:
+                balance — withdrawable USDC (perp) or available spot USDC.
+                total_value — account value including unrealized PnL.
+                positions — enriched position dicts with pnl and notional.
+                effective_collateral — C4: total USDC backing positions
+                    (spot_total for unified accounts; this is what should
+                    drive leverage calculations).
+                perp_notional — C4: sum of |size| * mark_price across
+                    active perp positions. Used with effective_collateral
+                    to compute true account leverage.
         """
         state = await self._retry(lambda: self.info.user_state(self.query_address))
         positions = state.get("assetPositions", [])
         total_value = float(state.get("accountValue", 0.0))
         enriched_positions = []
+        perp_notional = 0.0
         for pos_wrap in positions:
             pos = pos_wrap["position"]
             entry_px = float(pos.get("entryPx", 0) or 0)
@@ -398,14 +443,17 @@ class HyperliquidAPI:
             pnl = (current_px - entry_px) * abs(size) if side == "long" else (entry_px - current_px) * abs(size)
             pos["pnl"] = pnl
             pos["notional_entry"] = abs(size) * entry_px
+            pos["notional_mark"] = abs(size) * (current_px or entry_px)
+            perp_notional += pos["notional_mark"]
             enriched_positions.append(pos)
         balance = float(state.get("withdrawable", 0.0))
+        effective_collateral = balance
 
         # Unified account: funds live in spot USDC and act as cross-margin for
         # perp positions. The perp `withdrawable`/`accountValue` may be ~0 or
         # only reflect a sliver of unrealized PnL even when spot has plenty.
-        # Always query spot USDC; use whichever side reports more buying power.
-        # No-op for standard perp accounts (where spot USDC is empty).
+        # Always query spot USDC; use whichever side reports more buying power
+        # (no-op for standard perp accounts where spot USDC is empty).
         try:
             spot_state = await self._retry(
                 lambda: self.info.spot_user_state(self.query_address)
@@ -417,8 +465,13 @@ class HyperliquidAPI:
                     spot_available = spot_total - spot_hold
                     if spot_available > balance:
                         balance = spot_available
-                    # Total value = all spot USDC (including margin held for
-                    # open perp positions) plus current unrealized PnL.
+                    # C4: effective collateral = full spot USDC (the hold
+                    # portion is margin posted to back current positions,
+                    # but it still counts as collateral for those positions).
+                    if spot_total > effective_collateral:
+                        effective_collateral = spot_total
+                    # Total value = all spot USDC (including held margin)
+                    # plus current unrealized PnL.
                     perp_pnl = sum(p.get("pnl", 0.0) for p in enriched_positions)
                     spot_total_value = spot_total + perp_pnl
                     if spot_total_value > total_value:
@@ -429,7 +482,13 @@ class HyperliquidAPI:
 
         if not total_value:
             total_value = balance + sum(max(p.get("pnl", 0.0), 0.0) for p in enriched_positions)
-        return {"balance": balance, "total_value": total_value, "positions": enriched_positions}
+        return {
+            "balance": balance,
+            "total_value": total_value,
+            "positions": enriched_positions,
+            "effective_collateral": effective_collateral,
+            "perp_notional": perp_notional,
+        }
 
     async def get_current_price(self, asset):
         """Return the latest mid-price for ``asset``.
