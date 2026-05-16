@@ -365,6 +365,7 @@ def main():
                         "tp_oid": tr.get('tp_oid'),
                         "sl_oid": tr.get('sl_oid'),
                         "exit_plan": tr.get('exit_plan'),
+                        "entry_thesis": tr.get('entry_thesis'),  # S8
                         "opened_at": tr.get('opened_at')
                     }
                     for tr in active_trades
@@ -621,6 +622,30 @@ def main():
                         if asset in asset_atr_ratios:
                             output["atr_ratio"] = asset_atr_ratios[asset]
 
+                        # S7: For HIP-3 assets, check orderbook liquidity. If
+                        # spread > 0.5% or top-of-book depth < $500, cap the
+                        # allocation hard so we don't pay massive slippage on
+                        # thin synthetic perps.
+                        if ":" in asset:
+                            try:
+                                ob = await hyperliquid.get_orderbook(asset)
+                                if ob:
+                                    spread_pct = ob.get("spread_pct") or 0
+                                    side_depth = ob.get("ask_depth_usd" if is_buy else "bid_depth_usd") or 0
+                                    if spread_pct > 0.5 or side_depth < 500:
+                                        cap_pct = 5.0
+                                        max_alloc = (state.get('total_value') or 0) * (cap_pct / 100.0)
+                                        if max_alloc > 0 and alloc_usd > max_alloc:
+                                            add_event(
+                                                f"S7 {asset}: thin book (spread={spread_pct:.2f}%, "
+                                                f"depth=${side_depth:.0f}) — capping alloc "
+                                                f"${alloc_usd:.2f}→${max_alloc:.2f}"
+                                            )
+                                            alloc_usd = max(max_alloc, 11.0)
+                                            output["allocation_usd"] = alloc_usd
+                            except Exception as ob_err:
+                                add_event(f"S7 orderbook check failed for {asset}: {ob_err}")
+
                         # --- C1: Pre-trade position-existence check ---
                         # Prevents stacking: if a same-direction position already
                         # exists with comparable notional, skip the trade. If an
@@ -843,6 +868,7 @@ def main():
                                 "tp_oid": tp_oid,
                                 "sl_oid": sl_oid,
                                 "exit_plan": output["exit_plan"],
+                                "entry_thesis": output.get("rationale", "") or "",  # S8
                                 "opened_at": datetime.now(timezone.utc).isoformat()
                             })
                             save_active_trades()  # H5
