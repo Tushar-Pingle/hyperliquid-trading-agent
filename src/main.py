@@ -30,6 +30,21 @@ def clear_terminal():
     os.system('cls' if os.name == 'nt' else 'clear')
 
 
+def is_hip3_frozen(now: datetime | None = None) -> bool:
+    """S2: HIP-3 perp dexes (oil/gold/spx/silver) freeze their oracle over the
+    traditional-markets weekend. Block new entries and auto-close existing
+    positions from Fri 16:50 UTC through Sun 22:00 UTC."""
+    now = now or datetime.now(timezone.utc)
+    wd = now.weekday()  # Mon=0 .. Fri=4 Sat=5 Sun=6
+    if wd == 4 and (now.hour > 16 or (now.hour == 16 and now.minute >= 50)):
+        return True
+    if wd == 5:
+        return True
+    if wd == 6 and now.hour < 22:
+        return True
+    return False
+
+
 def get_interval_seconds(interval_str):
     """Convert interval strings like '5m' or '1h' to seconds."""
     if interval_str.endswith('m'):
@@ -203,6 +218,42 @@ def main():
             except Exception as risk_err:
                 add_event(f"Risk check error: {risk_err}")
 
+            # --- S2: HIP-3 weekend auto-close ---
+            # When the HIP-3 oracle freeze window is active (Fri 16:50 → Sun
+            # 22:00 UTC), close any open HIP-3 positions immediately. New
+            # entries are blocked separately in the trade-execution path.
+            if is_hip3_frozen():
+                for pos in state['positions']:
+                    coin = pos.get('coin') or ''
+                    if ':' not in coin:
+                        continue
+                    try:
+                        size = float(pos.get('szi') or 0)
+                    except (TypeError, ValueError):
+                        size = 0
+                    if size == 0:
+                        continue
+                    add_event(f"S2 WEEKEND CLOSE: {coin} (size={size}) — HIP-3 oracle frozen window")
+                    try:
+                        if size > 0:
+                            await hyperliquid.place_sell_order(coin, abs(size))
+                        else:
+                            await hyperliquid.place_buy_order(coin, abs(size))
+                        await hyperliquid.cancel_all_orders(coin)
+                        for tr in active_trades[:]:
+                            if tr.get('asset') == coin:
+                                active_trades.remove(tr)
+                        save_active_trades()
+                        with open(diary_path, "a") as f:
+                            f.write(json.dumps({
+                                "timestamp": datetime.now(timezone.utc).isoformat(),
+                                "asset": coin,
+                                "action": "hip3_weekend_close",
+                                "size": abs(size),
+                            }) + "\n")
+                    except Exception as ex:
+                        add_event(f"S2 weekend close failed for {coin}: {ex}")
+
             recent_diary = []
             try:
                 with open(diary_path, "r") as f:
@@ -326,6 +377,7 @@ def main():
             # Gather data for ALL assets first (using Hyperliquid candles + local indicators)
             market_sections = []
             asset_prices = {}
+            asset_atr_ratios = {}  # S4: short/long ATR ratio for vol-scaled sizing
             for asset in args.assets:
                 try:
                     current_price = await hyperliquid.get_current_price(asset)
@@ -343,6 +395,24 @@ def main():
                     intra = compute_all(candles_5m)
                     lt = compute_all(candles_4h)
 
+                    # S1: volume-spike ratio (current bar volume / 20-bar SMA volume)
+                    def _vol_spike(candles):
+                        vols = [c.get("volume", 0) for c in candles]
+                        if len(vols) < 20:
+                            return None
+                        sma_v = sum(vols[-20:]) / 20.0
+                        if sma_v <= 0:
+                            return None
+                        return round(vols[-1] / sma_v, 3)
+                    vol_spike_5m = _vol_spike(candles_5m)
+                    vol_spike_4h = _vol_spike(candles_4h)
+
+                    # S4: ATR ratio (short-term / long-term on 4h)
+                    atr3_lt = latest(lt.get("atr3", []))
+                    atr14_lt = latest(lt.get("atr14", []))
+                    if atr3_lt and atr14_lt and atr14_lt > 0:
+                        asset_atr_ratios[asset] = round(atr3_lt / atr14_lt, 3)
+
                     recent_mids = [entry["mid"] for entry in list(price_history.get(asset, []))[-10:]]
                     funding_annualized = round(funding * 24 * 365 * 100, 2) if funding else None
 
@@ -354,6 +424,7 @@ def main():
                             "macd": round_or_none(latest(intra.get("macd", [])), 2),
                             "rsi7": round_or_none(latest(intra.get("rsi7", [])), 2),
                             "rsi14": round_or_none(latest(intra.get("rsi14", [])), 2),
+                            "vol_spike_ratio": vol_spike_5m,
                             "series": {
                                 "ema20": round_series(last_n(intra.get("ema20", []), 10), 2),
                                 "macd": round_series(last_n(intra.get("macd", []), 10), 2),
@@ -364,18 +435,59 @@ def main():
                         "long_term": {
                             "ema20": round_or_none(latest(lt.get("ema20", [])), 2),
                             "ema50": round_or_none(latest(lt.get("ema50", [])), 2),
-                            "atr3": round_or_none(latest(lt.get("atr3", [])), 2),
-                            "atr14": round_or_none(latest(lt.get("atr14", [])), 2),
+                            "atr3": round_or_none(atr3_lt, 2),
+                            "atr14": round_or_none(atr14_lt, 2),
+                            "atr_ratio_short_over_long": asset_atr_ratios.get(asset),
+                            "vol_spike_ratio": vol_spike_4h,
                             "macd_series": round_series(last_n(lt.get("macd", []), 10), 2),
                             "rsi_series": round_series(last_n(lt.get("rsi14", []), 10), 2),
                         },
                         "open_interest": round_or_none(oi, 2),
                         "funding_rate": round_or_none(funding, 8),
                         "funding_annualized_pct": funding_annualized,
+                        "hip3_market_frozen": (':' in asset and is_hip3_frozen()),
                         "recent_mid_prices": recent_mids,
                     })
                 except Exception as e:
                     add_event(f"Data gather error {asset}: {e}")
+                    continue
+
+            # --- S3: Continuous exit-condition checking ---
+            # Before asking the LLM, evaluate each active trade's exit_plan
+            # against current indicators. If invalidated, market-close and
+            # cancel its TP/SL — removes the LLM-talking-itself-back-in
+            # failure mode.
+            for tr in active_trades[:]:
+                try:
+                    if not tr.get('exit_plan'):
+                        continue
+                    asset = tr.get('asset')
+                    if not asset:
+                        continue
+                    should_exit = await check_exit_condition(tr, hyperliquid)
+                    if not should_exit:
+                        continue
+                    add_event(f"S3 EXIT {asset}: invalidation triggered by exit_plan — closing")
+                    try:
+                        amt = abs(float(tr.get('amount') or 0))
+                        if amt > 0:
+                            if tr.get('is_long'):
+                                await hyperliquid.place_sell_order(asset, amt)
+                            else:
+                                await hyperliquid.place_buy_order(asset, amt)
+                        await hyperliquid.cancel_all_orders(asset)
+                        active_trades.remove(tr)
+                        save_active_trades()
+                        with open(diary_path, "a") as f:
+                            f.write(json.dumps({
+                                "timestamp": datetime.now(timezone.utc).isoformat(),
+                                "asset": asset,
+                                "action": "exit_invalidation",
+                                "exit_plan": tr.get('exit_plan'),
+                            }) + "\n")
+                    except Exception as ex:
+                        add_event(f"S3 exit close failed for {asset}: {ex}")
+                except Exception:
                     continue
 
             # Single LLM call with all assets
@@ -491,6 +603,23 @@ def main():
                         if alloc_usd <= 0:
                             add_event(f"Holding {asset}: zero/negative allocation")
                             continue
+
+                        # S2: Block new HIP-3 entries during weekend freeze
+                        if ':' in asset and is_hip3_frozen():
+                            add_event(f"S2 BLOCK {asset}: HIP-3 oracle frozen window — no new entries")
+                            with open(diary_path, "a") as f:
+                                f.write(json.dumps({
+                                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                                    "asset": asset,
+                                    "action": "hip3_weekend_block",
+                                    "requested_action": action,
+                                    "requested_alloc_usd": alloc_usd,
+                                }) + "\n")
+                            continue
+
+                        # S4: Pass ATR ratio to risk manager for vol-scaled sizing
+                        if asset in asset_atr_ratios:
+                            output["atr_ratio"] = asset_atr_ratios[asset]
 
                         # --- C1: Pre-trade position-existence check ---
                         # Prevents stacking: if a same-direction position already
