@@ -401,22 +401,31 @@ class HyperliquidAPI:
             enriched_positions.append(pos)
         balance = float(state.get("withdrawable", 0.0))
 
-        # Unified account: perps balance may be 0 while funds are in spot USDC.
-        # Check spot clearinghouse for the actual available balance.
-        if balance == 0 and total_value == 0:
-            try:
-                spot_state = await self._retry(
-                    lambda: self.info.spot_user_state(self.query_address)
-                )
-                for bal in spot_state.get("balances", []):
-                    if bal.get("coin") == "USDC":
-                        spot_total = float(bal.get("total", 0))
-                        spot_hold = float(bal.get("hold", 0))
-                        balance = spot_total - spot_hold
-                        total_value = balance + sum(p.get("pnl", 0.0) for p in enriched_positions)
-                        break
-            except Exception as e:
-                logging.warning("Failed to fetch spot state for unified account: %s", e)
+        # Unified account: funds live in spot USDC and act as cross-margin for
+        # perp positions. The perp `withdrawable`/`accountValue` may be ~0 or
+        # only reflect a sliver of unrealized PnL even when spot has plenty.
+        # Always query spot USDC; use whichever side reports more buying power.
+        # No-op for standard perp accounts (where spot USDC is empty).
+        try:
+            spot_state = await self._retry(
+                lambda: self.info.spot_user_state(self.query_address)
+            )
+            for bal in spot_state.get("balances", []):
+                if bal.get("coin") == "USDC":
+                    spot_total = float(bal.get("total", 0) or 0)
+                    spot_hold = float(bal.get("hold", 0) or 0)
+                    spot_available = spot_total - spot_hold
+                    if spot_available > balance:
+                        balance = spot_available
+                    # Total value = all spot USDC (including margin held for
+                    # open perp positions) plus current unrealized PnL.
+                    perp_pnl = sum(p.get("pnl", 0.0) for p in enriched_positions)
+                    spot_total_value = spot_total + perp_pnl
+                    if spot_total_value > total_value:
+                        total_value = spot_total_value
+                    break
+        except Exception as e:
+            logging.warning("Failed to fetch spot state for unified account: %s", e)
 
         if not total_value:
             total_value = balance + sum(max(p.get("pnl", 0.0), 0.0) for p in enriched_positions)
