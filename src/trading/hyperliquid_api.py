@@ -48,6 +48,7 @@ class HyperliquidAPI:
         """
         self._meta_cache = None
         self._hip3_meta_cache = {}  # {dex_name: meta_response}
+        self._perp_dex_offsets = {}  # {dex_name: asset_index_offset}
         if "hyperliquid_private_key" in CONFIG and CONFIG["hyperliquid_private_key"]:
             self.wallet = Account.from_key(CONFIG["hyperliquid_private_key"])
         elif "mnemonic" in CONFIG and CONFIG["mnemonic"]:
@@ -76,6 +77,15 @@ class HyperliquidAPI:
         self.info = Info(self.base_url)
         self.exchange = Exchange(self.wallet, self.base_url, account_address=self.account_address)
 
+    def _apply_hip3_meta_to_clients(self, meta: dict, offset: int) -> None:
+        """Register HIP-3 dex assets into SDK Info objects so order placement works."""
+        for info_obj in (self.info, self.exchange.info):
+            if hasattr(info_obj, 'set_perp_meta'):
+                try:
+                    info_obj.set_perp_meta(meta, offset)
+                except Exception as e:
+                    logging.warning("set_perp_meta failed on info object: %s", e)
+
     def _reset_clients(self):
         """Recreate SDK clients after connection failures while logging failures."""
         try:
@@ -83,6 +93,12 @@ class HyperliquidAPI:
             logging.warning("Hyperliquid clients re-instantiated after connection issue")
         except (ValueError, AttributeError, RuntimeError) as e:
             logging.error("Failed to reset Hyperliquid clients: %s", e)
+            return
+        # Re-apply any previously loaded HIP-3 dex metadata after the reset
+        for dex, data in self._hip3_meta_cache.items():
+            if isinstance(data, list) and len(data) >= 1:
+                offset = self._perp_dex_offsets.get(dex, 110000)
+                self._apply_hip3_meta_to_clients(data[0], offset)
 
     async def _retry(self, fn, *args, max_attempts: int = 3, backoff_base: float = 0.5, reset_on_fail: bool = True, to_thread: bool = True, **kwargs):
         """Retry helper with exponential backoff and optional thread offloading.
@@ -173,6 +189,11 @@ class HyperliquidAPI:
             Raw SDK response from :meth:`Exchange.market_open`.
         """
         amount = self.round_size(asset, amount)
+        if ":" in asset:
+            # HIP-3 dex asset: pass the current price explicitly so the SDK doesn't
+            # try to fetch it via all_mids() which doesn't cover HIP-3 assets.
+            px = await self.get_current_price(asset)
+            return await self._retry(lambda: self.exchange.market_open(asset, True, amount, px, slippage))
         return await self._retry(lambda: self.exchange.market_open(asset, True, amount, None, slippage))
 
     async def place_sell_order(self, asset, amount, slippage=0.01):
@@ -187,6 +208,11 @@ class HyperliquidAPI:
             Raw SDK response from :meth:`Exchange.market_open`.
         """
         amount = self.round_size(asset, amount)
+        if ":" in asset:
+            # HIP-3 dex asset: pass the current price explicitly so the SDK doesn't
+            # try to fetch it via all_mids() which doesn't cover HIP-3 assets.
+            px = await self.get_current_price(asset)
+            return await self._retry(lambda: self.exchange.market_open(asset, False, amount, px, slippage))
         return await self._retry(lambda: self.exchange.market_open(asset, False, amount, None, slippage))
 
     async def place_limit_buy(self, asset, amount, limit_price, tif="Gtc"):
@@ -419,6 +445,31 @@ class HyperliquidAPI:
             mids = await self._retry(self.info.all_mids)
         return float(mids.get(asset, 0.0))
 
+    async def _get_dex_offset(self, dex: str) -> int:
+        """Return the asset index offset for a HIP-3 perp dex.
+
+        Args:
+            dex: HIP-3 dex name (e.g. "xyz").
+
+        Returns:
+            Integer offset used by the SDK for asset index calculation.
+        """
+        if dex in self._perp_dex_offsets:
+            return self._perp_dex_offsets[dex]
+        try:
+            all_dexes = await self._retry(lambda: self.info.perp_dexs())
+            # all_dexes[0] is the default "" dex; HIP-3 dexes follow from index 1
+            for i, perp_dex in enumerate(all_dexes[1:]):
+                name = perp_dex.get("name") if isinstance(perp_dex, dict) else perp_dex
+                if name == dex:
+                    offset = 110000 + i * 10000
+                    self._perp_dex_offsets[dex] = offset
+                    return offset
+        except Exception as e:
+            logging.warning("Could not fetch perp_dexs for offset lookup (%s): %s", dex, e)
+        self._perp_dex_offsets[dex] = 110000
+        return 110000
+
     async def get_meta_and_ctxs(self, dex=None):
         """Return cached meta/context information, fetching once per lifecycle.
 
@@ -435,8 +486,9 @@ class HyperliquidAPI:
                 )
                 if isinstance(response, list) and len(response) >= 2:
                     self._hip3_meta_cache[dex] = response
-                    # Also cache the meta separately for round_size
-                    # Store as {dex: {"universe": [...]}}
+                    # Register HIP-3 assets in SDK clients so order placement works
+                    offset = await self._get_dex_offset(dex)
+                    self._apply_hip3_meta_to_clients(response[0], offset)
             return self._hip3_meta_cache.get(dex)
         if not self._meta_cache:
             response = await self._retry(self.info.meta_and_asset_ctxs)
