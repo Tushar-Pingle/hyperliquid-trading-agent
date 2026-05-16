@@ -74,14 +74,22 @@ class RiskManager:
             )
         return True, ""
 
-    def check_leverage(self, alloc_usd: float, balance: float) -> tuple[bool, str]:
-        """Effective leverage of new trade cannot exceed max_leverage."""
-        if balance <= 0:
-            return False, "Balance is zero or negative"
-        effective_lev = alloc_usd / balance
+    def check_leverage(self, alloc_usd: float, collateral: float,
+                        current_notional: float = 0.0) -> tuple[bool, str]:
+        """Aggregate account leverage (existing + new) cannot exceed max_leverage.
+
+        C4: Computes leverage as ``(current_perp_notional + new_alloc) / collateral``
+        so we never let a new trade push total leverage past the configured cap,
+        even on unified accounts where perp `withdrawable` reads as zero.
+        """
+        if collateral <= 0:
+            return False, "Collateral is zero or negative"
+        projected_notional = current_notional + alloc_usd
+        effective_lev = projected_notional / collateral
         if effective_lev > self.max_leverage:
             return False, (
-                f"Effective leverage {effective_lev:.1f}x exceeds max {self.max_leverage}x"
+                f"Projected total leverage {effective_lev:.2f}x (existing ${current_notional:.2f} + "
+                f"new ${alloc_usd:.2f} on ${collateral:.2f} collateral) exceeds max {self.max_leverage}x"
             )
         return True, ""
 
@@ -217,6 +225,10 @@ class RiskManager:
 
         account_value = float(account_state.get("total_value", 0))
         balance = float(account_state.get("balance", 0))
+        # C4: prefer effective_collateral (full spot USDC) over withdrawable
+        # for leverage calculations on unified accounts.
+        collateral = float(account_state.get("effective_collateral", balance) or balance)
+        current_perp_notional = float(account_state.get("perp_notional", 0) or 0)
         positions = account_state.get("positions", [])
         is_buy = action == "buy"
 
@@ -247,8 +259,8 @@ class RiskManager:
         if not ok:
             return False, reason, trade
 
-        # 5. Leverage check
-        ok, reason = self.check_leverage(alloc_usd, balance)
+        # 5. Leverage check (C4: uses true collateral and current notional)
+        ok, reason = self.check_leverage(alloc_usd, collateral, current_perp_notional)
         if not ok:
             return False, reason, trade
 
