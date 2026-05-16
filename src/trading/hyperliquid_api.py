@@ -430,8 +430,34 @@ class HyperliquidAPI:
                     to compute true account leverage.
         """
         state = await self._retry(lambda: self.info.user_state(self.query_address))
-        positions = state.get("assetPositions", [])
+        positions = list(state.get("assetPositions", []))
         total_value = float(state.get("accountValue", 0.0))
+
+        # HIP-3: info.user_state only returns MAIN perp dex positions. Positions
+        # held on HIP-3 builder-deployed perp dexes (e.g. "xyz") require an
+        # explicit dex= parameter on clearinghouseState. Without this, the bot
+        # is blind to HIP-3 positions — C1, force-close, leverage math, and
+        # reconcile all silently miss them, which is how the WTIOIL stack of
+        # 6+ contracts built up on a $267 account.
+        for dex_name in list(self._hip3_meta_cache.keys()):
+            try:
+                hip3_state = await self._retry(
+                    lambda d=dex_name: self.info.post("/info", {
+                        "type": "clearinghouseState",
+                        "user": self.query_address,
+                        "dex": d,
+                    })
+                )
+                hip3_positions = hip3_state.get("assetPositions", []) if isinstance(hip3_state, dict) else []
+                if hip3_positions:
+                    positions.extend(hip3_positions)
+                # Add HIP-3 account value to total (each dex has its own margin pool)
+                hip3_value = float(hip3_state.get("marginSummary", {}).get("accountValue", 0.0) or 0.0) if isinstance(hip3_state, dict) else 0.0
+                if hip3_value:
+                    total_value += hip3_value
+            except Exception as e:
+                logging.warning("Failed to fetch HIP-3 %s clearinghouseState: %s", dex_name, e)
+
         enriched_positions = []
         perp_notional = 0.0
         for pos_wrap in positions:
