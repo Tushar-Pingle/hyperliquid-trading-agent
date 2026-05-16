@@ -663,6 +663,47 @@ class HyperliquidAPI:
             })
         return candles
 
+    async def get_orderbook(self, asset, depth_levels: int = 5):
+        """S7: Fetch L2 orderbook for an asset and summarize spread + top-of-book depth.
+
+        Returns:
+            dict with keys:
+                best_bid, best_ask, mid, spread_pct (top-of-book spread as % of mid),
+                bid_depth_usd, ask_depth_usd (notional summed over top depth_levels),
+                or None on error / empty book.
+        """
+        try:
+            payload = {"type": "l2Book", "coin": asset}
+            if ":" in asset:
+                payload["dex"] = asset.split(":")[0]
+            book = await self._retry(lambda: self.info.post("/info", payload))
+            if not isinstance(book, dict):
+                return None
+            levels = book.get("levels") or []
+            if len(levels) < 2 or not levels[0] or not levels[1]:
+                return None
+            bids = levels[0][:depth_levels]
+            asks = levels[1][:depth_levels]
+            best_bid = float(bids[0].get("px", 0)) if bids else 0
+            best_ask = float(asks[0].get("px", 0)) if asks else 0
+            if best_bid <= 0 or best_ask <= 0:
+                return None
+            mid = (best_bid + best_ask) / 2.0
+            spread_pct = ((best_ask - best_bid) / mid) * 100 if mid else None
+            bid_depth_usd = sum(float(b.get("px", 0)) * float(b.get("sz", 0)) for b in bids)
+            ask_depth_usd = sum(float(a.get("px", 0)) * float(a.get("sz", 0)) for a in asks)
+            return {
+                "best_bid": best_bid,
+                "best_ask": best_ask,
+                "mid": mid,
+                "spread_pct": round(spread_pct, 4) if spread_pct is not None else None,
+                "bid_depth_usd": round(bid_depth_usd, 2),
+                "ask_depth_usd": round(ask_depth_usd, 2),
+            }
+        except (RuntimeError, ValueError, KeyError, ConnectionError, TypeError) as e:
+            logging.error("get_orderbook error for %s: %s", asset, e)
+            return None
+
     async def get_funding_rate(self, asset):
         """Return the most recent funding rate for ``asset`` if available.
 
