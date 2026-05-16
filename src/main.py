@@ -454,6 +454,11 @@ def main():
                         alloc_usd = float(output.get("allocation_usd", alloc_usd))
                         amount = alloc_usd / current_price
 
+                        # Cancel any stale TP/SL orders for this asset before
+                        # opening a new position (guards against duplicates after
+                        # service restarts that reset in-memory active_trades).
+                        await hyperliquid.cancel_all_orders(asset)
+
                         # Place market or limit order
                         order_type = output.get("order_type", "market")
                         limit_price = output.get("limit_price")
