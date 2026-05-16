@@ -449,10 +449,11 @@ class HyperliquidAPI:
         balance = float(state.get("withdrawable", 0.0))
         effective_collateral = balance
 
-        # Unified account: funds live in spot USDC and act as cross-margin
-        # for perp positions. Perp `withdrawable`/`accountValue` may be ~0
-        # even when spot has plenty. Always query spot; use whichever side
-        # reports more buying power (no-op for standard perp accounts).
+        # Unified account: funds live in spot USDC and act as cross-margin for
+        # perp positions. The perp `withdrawable`/`accountValue` may be ~0 or
+        # only reflect a sliver of unrealized PnL even when spot has plenty.
+        # Always query spot USDC; use whichever side reports more buying power
+        # (no-op for standard perp accounts where spot USDC is empty).
         try:
             spot_state = await self._retry(
                 lambda: self.info.spot_user_state(self.query_address)
@@ -466,10 +467,11 @@ class HyperliquidAPI:
                         balance = spot_available
                     # C4: effective collateral = full spot USDC (the hold
                     # portion is margin posted to back current positions,
-                    # not separate capital — but it is still backing those
-                    # positions, so it counts as collateral).
+                    # but it still counts as collateral for those positions).
                     if spot_total > effective_collateral:
                         effective_collateral = spot_total
+                    # Total value = all spot USDC (including held margin)
+                    # plus current unrealized PnL.
                     perp_pnl = sum(p.get("pnl", 0.0) for p in enriched_positions)
                     spot_total_value = spot_total + perp_pnl
                     if spot_total_value > total_value:
