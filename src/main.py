@@ -6,13 +6,14 @@ import pathlib
 sys.path.append(str(pathlib.Path(__file__).parent.parent))
 from src.agent.decision_maker import TradingAgent
 from src.indicators.local_indicators import compute_all, last_n, latest
-from src.risk_manager import RiskManager
+from src.risk_manager import RiskManager, normalize_coin
 from src.trading.hyperliquid_api import HyperliquidAPI
 import asyncio
 import logging
 from collections import deque, OrderedDict
 from datetime import datetime, timezone
 import math  # For Sharpe
+import time
 from dotenv import load_dotenv
 import os
 import json
@@ -83,6 +84,19 @@ def main():
     hyperliquid = HyperliquidAPI()
     agent = TradingAgent(hyperliquid=hyperliquid)
     risk_mgr = RiskManager()
+
+    # P1.2 — tell risk_mgr the bar duration so cooldown_bars × interval = real seconds
+    interval_sec = get_interval_seconds(args.interval)
+    risk_mgr.set_interval(interval_sec)
+    risk_mgr.load_cooldowns()
+
+    # P1.3 — warn when loop interval is shorter than recommended (cuts fee drag)
+    if interval_sec < 900:  # 15 m
+        logging.warning(
+            "P1.3: INTERVAL=%s (%ds) is below the recommended 15m minimum. "
+            "Shorter intervals increase fee drag — consider INTERVAL=15m.",
+            args.interval, interval_sec,
+        )
 
 
     start_time = datetime.now(timezone.utc)
@@ -157,6 +171,22 @@ def main():
         except Exception as e:
             add_event(f"H5: Error loading active_trades: {e}")
 
+        # P1.2 — seed cooldowns for any positions already held on the exchange
+        # so the bot cannot immediately stack or flip on the first cycle after
+        # a restart without serving a full cooldown window first.
+        try:
+            seed_state = await hyperliquid.get_user_state()
+            for _sp in seed_state.get("positions", []):
+                _coin = _sp.get("coin") or ""
+                try:
+                    _szi = float(_sp.get("szi") or 0)
+                except (TypeError, ValueError):
+                    _szi = 0.0
+                if _szi != 0:
+                    risk_mgr.seed_cooldown(_coin)
+        except Exception as _seed_err:
+            add_event(f"P1.2: cooldown seed error (non-fatal): {_seed_err}")
+
         while True:
             invocation_count += 1
             minutes_since_start = (datetime.now(timezone.utc) - start_time).total_seconds() / 60
@@ -200,6 +230,7 @@ def main():
                         else:
                             await hyperliquid.place_buy_order(coin, size)
                         await hyperliquid.cancel_all_orders(coin)
+                        risk_mgr.record_cooldown(coin, "force_close")  # P1.2
                         # Remove from active trades
                         for tr in active_trades[:]:
                             if tr.get('asset') == coin:
@@ -240,6 +271,7 @@ def main():
                         else:
                             await hyperliquid.place_buy_order(coin, abs(size))
                         await hyperliquid.cancel_all_orders(coin)
+                        risk_mgr.record_cooldown(coin, "weekend_close")  # P1.2
                         for tr in active_trades[:]:
                             if tr.get('asset') == coin:
                                 active_trades.remove(tr)
@@ -477,6 +509,7 @@ def main():
                             else:
                                 await hyperliquid.place_buy_order(asset, amt)
                         await hyperliquid.cancel_all_orders(asset)
+                        risk_mgr.record_cooldown(asset, "exit_invalidation")  # P1.2
                         active_trades.remove(tr)
                         save_active_trades()
                         with open(diary_path, "a") as f:
@@ -646,15 +679,15 @@ def main():
                             except Exception as ob_err:
                                 add_event(f"S7 orderbook check failed for {asset}: {ob_err}")
 
-                        # --- C1: Pre-trade position-existence check ---
-                        # Prevents stacking: if a same-direction position already
-                        # exists with comparable notional, skip the trade. If an
-                        # opposite-direction position exists, skip and log
-                        # (flip handling is a separate, deliberate operation).
+                        # --- C1 / P1.1: Pre-trade position-existence check ---
+                        # Hard block on same-direction stacking — no scale-in
+                        # carve-out.  Opposite-direction → flip (H6).
+                        # risk_mgr.validate_trade() also enforces check_stacking()
+                        # as a second line of defence (catches normalised aliases).
                         existing_szi = 0.0
                         existing_entry = 0.0
                         for pos in state.get('positions', []):
-                            if pos.get('coin') == asset:
+                            if normalize_coin(pos.get('coin') or '') == normalize_coin(asset):
                                 try:
                                     existing_szi = float(pos.get('szi') or 0)
                                     existing_entry = float(pos.get('entryPx') or 0)
@@ -665,23 +698,23 @@ def main():
                             existing_is_long = existing_szi > 0
                             existing_notional = abs(existing_szi) * (existing_entry or current_price)
                             if existing_is_long == is_buy:
-                                # Same direction — only allow add if existing notional
-                                # is < 50% of requested allocation (true scale-in case).
-                                if existing_notional >= alloc_usd * 0.5:
-                                    add_event(
-                                        f"SKIP {asset}: already at target — "
-                                        f"existing {('long' if existing_is_long else 'short')} "
-                                        f"notional ${existing_notional:.2f} vs requested ${alloc_usd:.2f}"
-                                    )
-                                    with open(diary_path, "a") as f:
-                                        f.write(json.dumps({
-                                            "timestamp": datetime.now(timezone.utc).isoformat(),
-                                            "asset": asset,
-                                            "action": "skip_already_open",
-                                            "existing_notional": existing_notional,
-                                            "requested_alloc_usd": alloc_usd,
-                                        }) + "\n")
-                                    continue
+                                # P1.1: Hard block — same-direction position exists.
+                                # No scale-in permitted (this was the WTIOIL stacking bug).
+                                add_event(
+                                    f"SKIP {asset}: stacking_blocked — "
+                                    f"existing {('long' if existing_is_long else 'short')} "
+                                    f"szi={existing_szi:.6f} notional=${existing_notional:.2f}"
+                                )
+                                with open(diary_path, "a") as f:
+                                    f.write(json.dumps({
+                                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                                        "asset": asset,
+                                        "action": "stacking_blocked",
+                                        "existing_szi": existing_szi,
+                                        "existing_notional": round(existing_notional, 2),
+                                        "requested_alloc_usd": alloc_usd,
+                                    }) + "\n")
+                                continue
                             else:
                                 # H6: Opposite direction — flip: close existing, then open new
                                 old_side = 'long' if existing_is_long else 'short'
@@ -722,6 +755,7 @@ def main():
                                         if tr.get('asset') == asset:
                                             active_trades.remove(tr)
                                     save_active_trades()  # H5
+                                    risk_mgr.record_cooldown(asset, "flip")  # P1.2
                                     with open(diary_path, "a") as f:
                                         f.write(json.dumps({
                                             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -764,51 +798,164 @@ def main():
                         # service restarts that reset in-memory active_trades).
                         await hyperliquid.cancel_all_orders(asset)
 
-                        # Place market or limit order
-                        order_type = output.get("order_type", "market")
-                        limit_price = output.get("limit_price")
-
-                        if order_type == "limit" and limit_price:
-                            limit_price = float(limit_price)
-                            if is_buy:
-                                order = await hyperliquid.place_limit_buy(asset, amount, limit_price)
-                            else:
-                                order = await hyperliquid.place_limit_sell(asset, amount, limit_price)
-                            add_event(f"LIMIT {action.upper()} {asset} amount {amount:.4f} at limit ${limit_price}")
-                        else:
-                            order = await hyperliquid.place_buy_order(asset, amount) if is_buy else await hyperliquid.place_sell_order(asset, amount)
-
-                        # H7/M9: Poll actual filled position size — HIP-3 gets more polls
+                        # --- P1.3: Entry order — post-only limit (default) or market ---
+                        entry_order_type_cfg = (
+                            CONFIG.get("entry_order_type") or "limit"
+                        ).lower()
+                        entry_limit_timeout = int(
+                            CONFIG.get("entry_limit_timeout_sec") or 90
+                        )
                         actual_size = amount
                         filled = False
-                        max_polls = 5 if ":" in asset else 3
-                        poll_delay = 0.5 if ":" in asset else 0.35
-                        for _poll in range(max_polls):
-                            await asyncio.sleep(poll_delay)
+                        order = None
+                        order_type = "limit" if entry_order_type_cfg != "market" else "market"
+                        limit_price = None
+
+                        if entry_order_type_cfg != "market":
+                            # Post-only limit entry: join best bid (buy) or best ask (sell).
+                            # If unfilled after timeout → cancel and skip.  No market fallback.
                             try:
-                                pos_state = await hyperliquid.get_user_state()
-                                for _p in pos_state.get('positions', []):
-                                    if _p.get('coin') == asset:
-                                        _szi = abs(float(_p.get('szi') or 0))
-                                        if _szi > 0:
-                                            actual_size = _szi
+                                ob = await hyperliquid.get_orderbook(asset)
+                            except Exception as ob_err:
+                                ob = None
+                                add_event(f"P1.3 orderbook error {asset}: {ob_err}")
+                            if not ob:
+                                add_event(
+                                    f"P1.3 SKIP {asset}: orderbook unavailable — "
+                                    "cannot place post-only limit entry"
+                                )
+                                with open(diary_path, "a") as f:
+                                    f.write(json.dumps({
+                                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                                        "asset": asset,
+                                        "action": "limit_entry_no_orderbook",
+                                    }) + "\n")
+                                continue
+
+                            limit_price = ob["best_bid"] if is_buy else ob["best_ask"]
+                            if is_buy:
+                                order = await hyperliquid.place_limit_buy(
+                                    asset, amount, limit_price, tif="Alo"
+                                )
+                            else:
+                                order = await hyperliquid.place_limit_sell(
+                                    asset, amount, limit_price, tif="Alo"
+                                )
+
+                            entry_oids = hyperliquid.extract_oids(order)
+                            entry_oid = entry_oids[0] if entry_oids else None
+
+                            if not entry_oid:
+                                add_event(
+                                    f"P1.3 SKIP {asset}: post-only limit rejected "
+                                    f"(no oid — order likely crossed spread at {limit_price})"
+                                )
+                                with open(diary_path, "a") as f:
+                                    f.write(json.dumps({
+                                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                                        "asset": asset,
+                                        "action": "limit_entry_rejected",
+                                        "limit_price": limit_price,
+                                    }) + "\n")
+                                continue
+
+                            add_event(
+                                f"P1.3: LIMIT {action.upper()} {asset} "
+                                f"{amount:.6f} @ {limit_price} post-only "
+                                f"(oid={entry_oid}, timeout={entry_limit_timeout}s)"
+                            )
+
+                            # Poll until filled or timeout — check every 5s
+                            deadline = time.monotonic() + entry_limit_timeout
+                            while time.monotonic() < deadline:
+                                await asyncio.sleep(5)
+                                try:
+                                    cur_orders = await hyperliquid.get_open_orders()
+                                    still_open = any(
+                                        o.get("oid") == entry_oid for o in cur_orders
+                                    )
+                                    if not still_open:
+                                        # Order gone — verify position appeared
+                                        pos_check = await hyperliquid.get_user_state()
+                                        for _pp in pos_check.get("positions", []):
+                                            if (
+                                                normalize_coin(_pp.get("coin") or "")
+                                                == normalize_coin(asset)
+                                            ):
+                                                _sz = abs(float(_pp.get("szi") or 0))
+                                                if _sz > 0:
+                                                    actual_size = _sz
+                                                    filled = True
+                                                break
+                                        break  # order gone — exit poll regardless
+                                except Exception as _poll_err:
+                                    add_event(f"P1.3 poll error {asset}: {_poll_err}")
+
+                            if not filled:
+                                # Timeout — cancel the resting order, skip trade
+                                try:
+                                    await hyperliquid.cancel_order(asset, entry_oid)
+                                except Exception as _ce:
+                                    add_event(f"P1.3 cancel error {asset}: {_ce}")
+                                add_event(
+                                    f"P1.3 SKIP {asset}: limit entry unfilled after "
+                                    f"{entry_limit_timeout}s — cancelled, no market fallback"
+                                )
+                                with open(diary_path, "a") as f:
+                                    f.write(json.dumps({
+                                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                                        "asset": asset,
+                                        "action": "limit_entry_timeout",
+                                        "limit_price": limit_price,
+                                        "timeout_sec": entry_limit_timeout,
+                                    }) + "\n")
+                                continue
+
+                        else:
+                            # Market entry path (ENTRY_ORDER_TYPE=market)
+                            order = (
+                                await hyperliquid.place_buy_order(asset, amount)
+                                if is_buy
+                                else await hyperliquid.place_sell_order(asset, amount)
+                            )
+                            order_type = "market"
+
+                            # H7/M9: Poll actual filled position size
+                            max_polls = 5 if ":" in asset else 3
+                            poll_delay = 0.5 if ":" in asset else 0.35
+                            for _poll in range(max_polls):
+                                await asyncio.sleep(poll_delay)
+                                try:
+                                    pos_state = await hyperliquid.get_user_state()
+                                    for _p in pos_state.get("positions", []):
+                                        if _p.get("coin") == asset:
+                                            _szi = abs(float(_p.get("szi") or 0))
+                                            if _szi > 0:
+                                                actual_size = _szi
+                                                filled = True
+                                                break
+                                except Exception:
+                                    pass
+                                if filled:
+                                    break
+                            if not filled:
+                                fills_check = await hyperliquid.get_recent_fills(limit=10)
+                                for fc in reversed(fills_check):
+                                    try:
+                                        if (
+                                            fc.get("coin") == asset
+                                            or fc.get("asset") == asset
+                                        ):
                                             filled = True
                                             break
-                            except Exception:
-                                pass
-                            if filled:
-                                break
-                        if not filled:
-                            # Fallback: check recent fills
-                            fills_check = await hyperliquid.get_recent_fills(limit=10)
-                            for fc in reversed(fills_check):
-                                try:
-                                    if fc.get('coin') == asset or fc.get('asset') == asset:
-                                        filled = True
-                                        break
-                                except Exception:
-                                    continue
-                        add_event(f"{action.upper()} {asset} amount {actual_size:.6f} at ~{current_price} (filled={filled})")
+                                    except Exception:
+                                        continue
+
+                        add_event(
+                            f"{action.upper()} {asset} amount {actual_size:.6f} "
+                            f"at ~{current_price} (filled={filled}, "
+                            f"entry={order_type}{'@'+str(limit_price) if limit_price else ''})"
+                        )
 
                         trade_log.append({"type": action, "price": current_price, "amount": actual_size, "exit_plan": output["exit_plan"], "filled": filled})
 
@@ -872,6 +1019,7 @@ def main():
                                 "opened_at": datetime.now(timezone.utc).isoformat()
                             })
                             save_active_trades()  # H5
+                            risk_mgr.record_cooldown(asset, action)  # P1.2
                             if rationale:
                                 add_event(f"Post-trade rationale for {asset}: {rationale}")
                             with open(diary_path, "a") as f:

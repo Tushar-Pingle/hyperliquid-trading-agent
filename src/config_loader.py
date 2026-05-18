@@ -105,6 +105,16 @@ CONFIG = {
     "api_host": _get_env("API_HOST", "0.0.0.0"),
     "api_port": _get_env("APP_PORT") or _get_env("API_PORT") or "3000",
 
+    # P1.2 — per-asset cooldown
+    "cooldown_bars": _get_env("COOLDOWN_BARS", "3"),           # bars of silence after any open/close/flip
+
+    # P1.3 — fee reduction / limit entries
+    "entry_order_type": _get_env("ENTRY_ORDER_TYPE", "limit"), # "limit" (post-only) or "market"
+    "entry_limit_timeout_sec": _get_env("ENTRY_LIMIT_TIMEOUT_SEC", "90"),  # cancel unfilled limit after N s
+
+    # P1.1 — stacking guard escape hatch (leave false unless you deliberately want scale-in)
+    "stacking_allow_scale_in": _get_bool("STACKING_ALLOW_SCALE_IN", False),
+
     # Legacy / optional
     "taapi_api_key": _get_env("TAAPI_API_KEY"),
     "openrouter_api_key": _get_env("OPENROUTER_API_KEY"),
