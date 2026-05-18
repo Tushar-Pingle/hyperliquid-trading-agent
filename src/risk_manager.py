@@ -84,13 +84,20 @@ class RiskManager:
     # ------------------------------------------------------------------
 
     def load_cooldowns(self) -> None:
-        """Load persisted cooldowns from disk. Best-effort — never raises."""
+        """Load persisted cooldowns from disk. Best-effort — never raises.
+
+        Creates an empty ``cooldowns.json`` on first run so the file always
+        exists after startup.  Absence of the file after boot is therefore a
+        real error, not an ambiguous "no trades yet" state.
+        """
         try:
             with open(self.COOLDOWNS_PATH) as f:
                 self._cooldowns = json.load(f)
             logging.info("RISK: Loaded cooldowns for %d asset(s)", len(self._cooldowns))
         except FileNotFoundError:
             self._cooldowns = {}
+            self._save_cooldowns()  # create the file immediately
+            logging.info("RISK P1.2: Created empty cooldowns.json (first run)")
         except Exception as e:
             logging.warning("RISK: Failed to load cooldowns (starting fresh): %s", e)
             self._cooldowns = {}
