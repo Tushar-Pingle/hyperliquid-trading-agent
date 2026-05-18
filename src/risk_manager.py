@@ -5,14 +5,48 @@ The LLM cannot override these limits — they are hard-coded checks
 applied before every trade execution.
 """
 
+import json
 import logging
 from datetime import datetime, timezone
 
 from src.config_loader import CONFIG
 
+# ---------------------------------------------------------------------------
+# Coin normalisation — P1.1
+# ---------------------------------------------------------------------------
+
+# Maps lowercase(display_label) → canonical API symbol.
+# Only add entries where the UI label differs from the API symbol.
+_COIN_ALIASES: dict[str, str] = {
+    "wtioil": "xyz:CL",      # Hyperliquid UI shows "WTIOIL" for xyz:CL
+    "xyz:wtioil": "xyz:CL",  # belt-and-suspenders
+}
+
+
+def normalize_coin(symbol: str) -> str:
+    """Return the canonical API symbol for *symbol*.
+
+    Handles two classes of alias:
+    1. ``"COIN (xyz)"`` suffix — the UI appends ``(xyz)`` to HIP-3 assets.
+       Strip the suffix and prepend ``xyz:`` to get the API form.
+    2. Known rename aliases (e.g. ``WTIOIL`` → ``xyz:CL``).
+
+    Symbols that already match the API form (e.g. ``xyz:CL``, ``BTC``) pass
+    through unchanged.
+    """
+    s = symbol.strip()
+    # Strip trailing "(xyz)" marker that the Hyperliquid UI appends
+    if s.lower().endswith("(xyz)"):
+        base = s[:-5].strip()
+        s = base if base.startswith("xyz:") else f"xyz:{base}"
+    # Apply rename aliases (case-insensitive lookup)
+    return _COIN_ALIASES.get(s.lower(), s)
+
 
 class RiskManager:
     """Enforces risk limits on every trade before execution."""
+
+    COOLDOWNS_PATH = "cooldowns.json"
 
     def __init__(self):
         self.max_position_pct = float(CONFIG.get("max_position_pct") or 10)
@@ -24,11 +58,168 @@ class RiskManager:
         self.max_concurrent_positions = int(CONFIG.get("max_concurrent_positions") or 10)
         self.min_balance_reserve_pct = float(CONFIG.get("min_balance_reserve_pct") or 20)
 
+        # P1.1 — stacking guard
+        self.allow_scale_in = bool(CONFIG.get("stacking_allow_scale_in", False))
+
+        # P1.2 — per-asset cooldown
+        self.cooldown_bars = int(CONFIG.get("cooldown_bars") or 3)
+        self.interval_sec = 300.0  # default 5 m; set by set_interval() after arg parsing
+        self._cooldowns: dict = {}  # {canonical_coin: {last_action_ts, last_action}}
+
         # Daily tracking
         self.daily_high_value = None
         self.daily_high_date = None
         self.circuit_breaker_active = False
         self.circuit_breaker_date = None
+
+    # ------------------------------------------------------------------
+    # Interval setter — called once from main() after args are parsed
+    # ------------------------------------------------------------------
+
+    def set_interval(self, interval_sec: float) -> None:
+        self.interval_sec = float(interval_sec)
+
+    # ------------------------------------------------------------------
+    # Cooldown persistence — P1.2
+    # ------------------------------------------------------------------
+
+    def load_cooldowns(self) -> None:
+        """Load persisted cooldowns from disk. Best-effort — never raises."""
+        try:
+            with open(self.COOLDOWNS_PATH) as f:
+                self._cooldowns = json.load(f)
+            logging.info("RISK: Loaded cooldowns for %d asset(s)", len(self._cooldowns))
+        except FileNotFoundError:
+            self._cooldowns = {}
+        except Exception as e:
+            logging.warning("RISK: Failed to load cooldowns (starting fresh): %s", e)
+            self._cooldowns = {}
+
+    def _save_cooldowns(self) -> None:
+        """Persist cooldowns to disk. Best-effort — never raises, never blocks exits."""
+        try:
+            with open(self.COOLDOWNS_PATH, "w") as f:
+                json.dump(self._cooldowns, f, default=str)
+        except Exception as e:
+            logging.warning("RISK: Failed to save cooldowns (non-fatal): %s", e)
+
+    def record_cooldown(self, coin: str, action: str) -> None:
+        """Record a trade action timestamp for *coin* and persist.
+
+        Best-effort — never raises, never blocks an exit.
+        """
+        try:
+            canonical = normalize_coin(coin)
+            self._cooldowns[canonical] = {
+                "last_action_ts": datetime.now(timezone.utc).isoformat(),
+                "last_action": action,
+            }
+            self._save_cooldowns()
+            logging.info("RISK P1.2: Cooldown started for %s (%s)", canonical, action)
+        except Exception as e:
+            logging.warning("RISK: record_cooldown failed for %s (non-fatal): %s", coin, e)
+
+    def seed_cooldown(self, coin: str) -> None:
+        """Seed a startup cooldown for an already-held position.
+
+        Called at startup for every position on the exchange so that the bot
+        cannot immediately stack or flip an existing position on the first
+        cycle after a restart.  Only seeds if no cooldown is already recorded.
+        """
+        try:
+            canonical = normalize_coin(coin)
+            if canonical not in self._cooldowns:
+                self._cooldowns[canonical] = {
+                    "last_action_ts": datetime.now(timezone.utc).isoformat(),
+                    "last_action": "startup_seed",
+                }
+                self._save_cooldowns()
+                logging.info(
+                    "RISK P1.2: Seeded startup cooldown for %s (existing position)", canonical
+                )
+        except Exception as e:
+            logging.warning("RISK: seed_cooldown failed for %s (non-fatal): %s", coin, e)
+
+    # ------------------------------------------------------------------
+    # P1.1 — Stacking guard
+    # ------------------------------------------------------------------
+
+    def check_stacking(self, coin: str, is_buy: bool,
+                        positions: list) -> tuple[bool, str]:
+        """Reject any new entry when a same-direction position already exists.
+
+        Args:
+            coin:      Asset symbol from the LLM decision (may be a display label).
+            is_buy:    True for a long entry, False for a short entry.
+            positions: Live position list from ``account_state["positions"]``.
+
+        Returns:
+            (allowed, reason) — reason is ``""`` when allowed.
+        """
+        if self.allow_scale_in:
+            return True, ""
+
+        canonical = normalize_coin(coin)
+        for pos in positions:
+            pos_coin = normalize_coin(pos.get("coin") or "")
+            if pos_coin != canonical:
+                continue
+            try:
+                szi = float(pos.get("szi") or 0)
+            except (TypeError, ValueError):
+                continue
+            if szi == 0:
+                continue
+            pos_is_long = szi > 0
+            if pos_is_long == is_buy:
+                direction = "long" if pos_is_long else "short"
+                return False, (
+                    f"stacking_blocked: {canonical} already has a {direction} "
+                    f"position (szi={szi:.6f})"
+                )
+        return True, ""
+
+    # ------------------------------------------------------------------
+    # P1.2 — Cooldown guard
+    # ------------------------------------------------------------------
+
+    def check_cooldown(self, coin: str, now: datetime) -> tuple[bool, str]:
+        """Reject a new entry if the asset is inside its cooldown window.
+
+        The cooldown window is ``COOLDOWN_BARS × interval_sec`` seconds after
+        the last open, close, or flip on the asset.
+
+        Args:
+            coin: Asset symbol (may be a display label).
+            now:  Current UTC datetime.
+
+        Returns:
+            (allowed, reason) — reason is ``""`` when allowed.
+        """
+        canonical = normalize_coin(coin)
+        entry = self._cooldowns.get(canonical)
+        if not entry:
+            return True, ""
+        last_ts_str = entry.get("last_action_ts")
+        if not last_ts_str:
+            return True, ""
+        try:
+            last_ts = datetime.fromisoformat(last_ts_str)
+            if last_ts.tzinfo is None:
+                last_ts = last_ts.replace(tzinfo=timezone.utc)
+        except Exception:
+            return True, ""  # Unparseable timestamp — don't block
+
+        cooldown_sec = self.cooldown_bars * self.interval_sec
+        elapsed = (now - last_ts).total_seconds()
+        remaining = cooldown_sec - elapsed
+        if remaining > 0:
+            return False, (
+                f"cooldown_active: {canonical} last touched {elapsed:.0f}s ago, "
+                f"{remaining:.0f}s remaining "
+                f"({self.cooldown_bars} bars × {self.interval_sec:.0f}s)"
+            )
+        return True, ""
 
     def _reset_daily_if_needed(self, account_value: float):
         """Reset daily high watermark at UTC day boundary."""
@@ -213,6 +404,21 @@ class RiskManager:
         if action == "hold":
             return True, "", trade
 
+        coin = trade.get("asset", "")
+        is_buy = action == "buy"
+        positions = account_state.get("positions", [])
+        now = datetime.now(timezone.utc)
+
+        # P1.2 — cooldown check (before any other guard; exits bypass this)
+        ok, reason = self.check_cooldown(coin, now)
+        if not ok:
+            return False, reason, trade
+
+        # P1.1 — stacking guard (hard block, no scale-in carve-out)
+        ok, reason = self.check_stacking(coin, is_buy, positions)
+        if not ok:
+            return False, reason, trade
+
         alloc_usd = float(trade.get("allocation_usd", 0))
         if alloc_usd <= 0:
             return False, "Zero or negative allocation", trade
@@ -251,8 +457,7 @@ class RiskManager:
         # for leverage calculations on unified accounts.
         collateral = float(account_state.get("effective_collateral", balance) or balance)
         current_perp_notional = float(account_state.get("perp_notional", 0) or 0)
-        positions = account_state.get("positions", [])
-        is_buy = action == "buy"
+        # positions and is_buy already set above for P1.1/P1.2 checks
 
         # 1. Daily drawdown circuit breaker
         ok, reason = self.check_daily_drawdown(account_value)
@@ -319,4 +524,7 @@ class RiskManager:
             "max_concurrent_positions": self.max_concurrent_positions,
             "min_balance_reserve_pct": self.min_balance_reserve_pct,
             "circuit_breaker_active": self.circuit_breaker_active,
+            "cooldown_bars": self.cooldown_bars,
+            "cooldown_sec": self.cooldown_bars * self.interval_sec,
+            "stacking_blocked": not self.allow_scale_in,
         }
