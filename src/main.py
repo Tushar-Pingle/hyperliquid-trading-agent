@@ -867,23 +867,29 @@ def main():
 
                             # Poll until filled or timeout — check every 5 s.
                             #
-                            # Design notes:
-                            # - poll_start is tracked separately so the SKIP log
-                            #   prints the real elapsed time, not a hardcoded value.
-                            # - _seen_in_feed guards against a false-early-exit caused
-                            #   by feed latency: if the order has never appeared in
-                            #   frontend_open_orders yet, we give it a 10 s grace
-                            #   period before treating "not visible" as "rejected".
-                            # - Partial fills: if the order disappears but a position
-                            #   of any size exists, treat it as filled (actual_size
-                            #   reflects what was actually executed).
+                            # Three legitimate exit conditions:
+                            #   (a) position confirmed       → filled = True
+                            #   (b) order was seen resting and is now gone
+                            #       with no position         → confirmed cancelled
+                            #   (c) full timeout elapsed     → loop exits naturally
+                            #
+                            # If the order's oid is NEVER observed in
+                            # frontend_open_orders (e.g. feed propagation lag —
+                            # which can exceed any short grace period — or the
+                            # exchange rejected it without acknowledging the oid),
+                            # we keep polling for the full ENTRY_LIMIT_TIMEOUT_SEC
+                            # rather than exiting early.  An order whose state is
+                            # never confirmed either way rests the full timeout.
+                            #
+                            # Partial fills: if the order disappears but any
+                            # position size > 0 exists, treat as filled and use
+                            # the exchange-reported size as actual_size.
                             poll_start = time.monotonic()
                             deadline = poll_start + entry_limit_timeout
                             _seen_in_feed = False
 
                             while time.monotonic() < deadline:
                                 await asyncio.sleep(5)
-                                elapsed = time.monotonic() - poll_start
                                 try:
                                     cur_orders = await hyperliquid.get_open_orders()
                                     still_open = any(
@@ -909,15 +915,16 @@ def main():
                                             break
 
                                     if filled:
-                                        break  # position confirmed — done
+                                        break  # (a) position confirmed
 
-                                    # No position and order not in feed.
-                                    # Exit early only once we're past the grace period
-                                    # (avoids false-skip due to propagation delay).
-                                    if _seen_in_feed or elapsed >= 10:
-                                        break  # order definitely gone, no fill
+                                    if _seen_in_feed:
+                                        # (b) was resting, now gone, no position →
+                                        # confirmed cancelled/rejected.  Stop early.
+                                        break
 
-                                    # else: feed lag grace period — keep polling
+                                    # Never observed in feed yet — could be feed
+                                    # lag or silent rejection.  Don't guess: keep
+                                    # polling until the full timeout (c).
 
                                 except Exception as _poll_err:
                                     add_event(f"P1.3 poll error {asset}: {_poll_err}")
