@@ -865,41 +865,75 @@ def main():
                                 f"(oid={entry_oid}, timeout={entry_limit_timeout}s)"
                             )
 
-                            # Poll until filled or timeout — check every 5s
-                            deadline = time.monotonic() + entry_limit_timeout
+                            # Poll until filled or timeout — check every 5 s.
+                            #
+                            # Design notes:
+                            # - poll_start is tracked separately so the SKIP log
+                            #   prints the real elapsed time, not a hardcoded value.
+                            # - _seen_in_feed guards against a false-early-exit caused
+                            #   by feed latency: if the order has never appeared in
+                            #   frontend_open_orders yet, we give it a 10 s grace
+                            #   period before treating "not visible" as "rejected".
+                            # - Partial fills: if the order disappears but a position
+                            #   of any size exists, treat it as filled (actual_size
+                            #   reflects what was actually executed).
+                            poll_start = time.monotonic()
+                            deadline = poll_start + entry_limit_timeout
+                            _seen_in_feed = False
+
                             while time.monotonic() < deadline:
                                 await asyncio.sleep(5)
+                                elapsed = time.monotonic() - poll_start
                                 try:
                                     cur_orders = await hyperliquid.get_open_orders()
                                     still_open = any(
                                         o.get("oid") == entry_oid for o in cur_orders
                                     )
-                                    if not still_open:
-                                        # Order gone — verify position appeared
-                                        pos_check = await hyperliquid.get_user_state()
-                                        for _pp in pos_check.get("positions", []):
-                                            if (
-                                                normalize_coin(_pp.get("coin") or "")
-                                                == normalize_coin(asset)
-                                            ):
-                                                _sz = abs(float(_pp.get("szi") or 0))
-                                                if _sz > 0:
-                                                    actual_size = _sz
-                                                    filled = True
-                                                break
-                                        break  # order gone — exit poll regardless
+
+                                    if still_open:
+                                        _seen_in_feed = True
+                                        continue  # order resting — keep waiting
+
+                                    # Order not visible in feed.
+                                    # Check for position (full or partial fill).
+                                    pos_check = await hyperliquid.get_user_state()
+                                    for _pp in pos_check.get("positions", []):
+                                        if (
+                                            normalize_coin(_pp.get("coin") or "")
+                                            == normalize_coin(asset)
+                                        ):
+                                            _sz = abs(float(_pp.get("szi") or 0))
+                                            if _sz > 0:
+                                                actual_size = _sz  # partial fill ok
+                                                filled = True
+                                            break
+
+                                    if filled:
+                                        break  # position confirmed — done
+
+                                    # No position and order not in feed.
+                                    # Exit early only once we're past the grace period
+                                    # (avoids false-skip due to propagation delay).
+                                    if _seen_in_feed or elapsed >= 10:
+                                        break  # order definitely gone, no fill
+
+                                    # else: feed lag grace period — keep polling
+
                                 except Exception as _poll_err:
                                     add_event(f"P1.3 poll error {asset}: {_poll_err}")
+                                    # Keep polling on errors until timeout
 
+                            elapsed_sec = time.monotonic() - poll_start
                             if not filled:
-                                # Timeout — cancel the resting order, skip trade
+                                # Order unfilled — cancel any resting portion and skip.
+                                # No market fallback.
                                 try:
                                     await hyperliquid.cancel_order(asset, entry_oid)
                                 except Exception as _ce:
                                     add_event(f"P1.3 cancel error {asset}: {_ce}")
                                 add_event(
                                     f"P1.3 SKIP {asset}: limit entry unfilled after "
-                                    f"{entry_limit_timeout}s — cancelled, no market fallback"
+                                    f"{elapsed_sec:.0f}s — cancelled, no market fallback"
                                 )
                                 with open(diary_path, "a") as f:
                                     f.write(json.dumps({
@@ -907,6 +941,7 @@ def main():
                                         "asset": asset,
                                         "action": "limit_entry_timeout",
                                         "limit_price": limit_price,
+                                        "elapsed_sec": round(elapsed_sec, 1),
                                         "timeout_sec": entry_limit_timeout,
                                     }) + "\n")
                                 continue
