@@ -106,8 +106,8 @@ def main():
     invocation_count = 0
     trade_log = []  # P2.5: closed-trade records loaded from TRADE_LOG_PATH
     TRADE_LOG_PATH = "trade_log.jsonl"
-    SHARPE_WINDOW = int(CFG.get("sharpe_window") or 50)
-    MIN_SHARPE_SAMPLE = int(CFG.get("min_sharpe_sample") or 10)
+    SHARPE_WINDOW = int(CONFIG.get("sharpe_window") or 50)
+    MIN_SHARPE_SAMPLE = int(CONFIG.get("min_sharpe_sample") or 10)
     ACTIVE_TRADES_PATH = "active_trades.json"
     active_trades = []  # persisted to ACTIVE_TRADES_PATH — loaded/reconciled on startup
     recent_events = deque(maxlen=200)
@@ -172,7 +172,7 @@ def main():
                     duration_sec = None
             # Compute margin if not provided: notional / leverage (P2.4)
             if margin is None and entry_price and size:
-                lev = leverage if leverage and leverage > 0 else float(CFG.get("max_leverage") or 10)
+                lev = leverage if leverage and leverage > 0 else float(CONFIG.get("max_leverage") or 10)
                 margin = abs(float(size)) * float(entry_price) / lev
             write_trade_log({
                 "asset": asset,
@@ -1328,10 +1328,9 @@ def main():
         """Start the aiohttp server and kick off the trading loop."""
         app = web.Application()
         await start_api(app)
-        from src.config_loader import CONFIG as CFG
         runner = web.AppRunner(app)
         await runner.setup()
-        site = web.TCPSite(runner, CFG.get("api_host"), int(CFG.get("api_port")))
+        site = web.TCPSite(runner, CONFIG.get("api_host"), int(CONFIG.get("api_port")))
         await site.start()
         await run_loop()
 
