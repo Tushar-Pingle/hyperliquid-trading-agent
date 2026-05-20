@@ -225,7 +225,12 @@ def main():
                     coin = ptc["coin"]
                     size = ptc["size"]
                     is_long = ptc["is_long"]
-                    add_event(f"RISK FORCE-CLOSE: {coin} at {ptc['loss_pct']}% loss (PnL: ${ptc['pnl']})")
+                    add_event(
+                        f"RISK FORCE-CLOSE: {coin} margin-loss {ptc['loss_pct']}% "
+                        f"(pnl=${ptc['pnl']}, margin=${ptc.get('margin', 0)}, "
+                        f"lev={ptc.get('leverage', '?')}x"
+                        f"{' [fallback]' if ptc.get('leverage_fallback') else ''})"
+                    )
                     try:
                         if is_long:
                             await hyperliquid.place_sell_order(coin, size)
@@ -245,6 +250,9 @@ def main():
                                 "action": "risk_force_close",
                                 "loss_pct": ptc["loss_pct"],
                                 "pnl": ptc["pnl"],
+                                "margin": ptc.get("margin"),
+                                "leverage": ptc.get("leverage"),
+                                "leverage_fallback": ptc.get("leverage_fallback", False),
                             }) + "\n")
                     except Exception as fc_err:
                         add_event(f"Force-close error for {coin}: {fc_err}")

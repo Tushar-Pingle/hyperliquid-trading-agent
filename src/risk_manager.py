@@ -370,10 +370,22 @@ class RiskManager:
     def check_losing_positions(self, positions: list[dict]) -> list[dict]:
         """Return positions that should be force-closed due to excessive loss.
 
+        P2.4: loss_pct is now ``|pnl| / margin``, not ``|pnl| / notional``.
+        Margin = notional / leverage. At 10× leverage a 2% adverse price move
+        is a 20% margin hit — and 20% is what MAX_LOSS_PER_POSITION_PCT now
+        means. The old formula understated loss by the leverage factor and
+        let positions run to a 100%+ margin loss before tripping.
+
+        Leverage source:
+          1. ``pos["leverage"]["value"]`` (cross OR isolated) — Hyperliquid
+             surfaces effective leverage here for both modes
+          2. Fallback when field missing/malformed: ``MAX_LEVERAGE`` from config
+             (NEVER 1.0 — that would under-trigger force-close on real positions)
+
         Args:
             positions: List of position dicts with keys:
                 coin/symbol, szi/quantity, entryPx/entry_price,
-                pnl/unrealized_pnl
+                pnl/unrealized_pnl, leverage
 
         Returns:
             List of positions that exceed the max loss threshold.
@@ -392,12 +404,45 @@ class RiskManager:
             if notional == 0:
                 continue
 
-            loss_pct = abs(pnl / notional) * 100 if pnl < 0 else 0
+            # P2.4: extract leverage with safe fallback
+            leverage = None
+            lev_raw = pos.get("leverage")
+            if isinstance(lev_raw, dict):
+                lev_val = lev_raw.get("value")
+                if lev_val is not None:
+                    try:
+                        leverage = float(lev_val)
+                    except (TypeError, ValueError):
+                        leverage = None
+            elif lev_raw is not None:
+                try:
+                    leverage = float(lev_raw)
+                except (TypeError, ValueError):
+                    leverage = None
+
+            fallback_used = False
+            if leverage is None or leverage <= 0:
+                leverage = max(1.0, self.max_leverage)
+                fallback_used = True
+                logging.info(
+                    "RISK P2.4: leverage field missing/malformed for %s — "
+                    "fallback to MAX_LEVERAGE=%.1f",
+                    coin, leverage,
+                )
+
+            margin = notional / leverage
+            if margin == 0:
+                continue
+
+            loss_pct = abs(pnl / margin) * 100 if pnl < 0 else 0
 
             if loss_pct >= self.max_loss_per_position_pct:
                 logging.warning(
-                    "RISK: Force-closing %s — loss %.2f%% exceeds max %.2f%%",
-                    coin, loss_pct, self.max_loss_per_position_pct
+                    "RISK: Force-closing %s — margin loss %.2f%% exceeds max %.2f%% "
+                    "(pnl=$%.2f, margin=$%.2f, leverage=%.1fx%s)",
+                    coin, loss_pct, self.max_loss_per_position_pct,
+                    pnl, margin, leverage,
+                    " [fallback]" if fallback_used else "",
                 )
                 to_close.append({
                     "coin": coin,
@@ -405,6 +450,9 @@ class RiskManager:
                     "is_long": size > 0,
                     "loss_pct": round(loss_pct, 2),
                     "pnl": round(pnl, 2),
+                    "margin": round(margin, 2),
+                    "leverage": leverage,
+                    "leverage_fallback": fallback_used,
                 })
         return to_close
 
