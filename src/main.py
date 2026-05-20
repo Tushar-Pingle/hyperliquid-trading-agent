@@ -1369,26 +1369,6 @@ def main():
         std = math.sqrt(var) if var > 0 else 0
         return mean / std if std > 0 else 0
 
-    async def check_exit_condition(trade, hyperliquid_api):
-        """Evaluate whether a given trade's exit plan triggers a close."""
-        plan = (trade.get("exit_plan") or "").lower()
-        if not plan:
-            return False
-        try:
-            candles_4h = await hyperliquid_api.get_candles(trade["asset"], "4h", 60)
-            indicators = compute_all(candles_4h)
-            if "macd" in plan and "below" in plan:
-                macd_val = latest(indicators.get("macd", []))
-                threshold = float(plan.split("below")[-1].strip())
-                return macd_val is not None and macd_val < threshold
-            if "close above ema50" in plan:
-                ema50_val = latest(indicators.get("ema50", []))
-                current = await hyperliquid_api.get_current_price(trade["asset"])
-                return ema50_val is not None and current > ema50_val
-        except Exception:
-            return False
-        return False
-
     asyncio.run(main_async())
 
 
