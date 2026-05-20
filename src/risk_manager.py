@@ -602,7 +602,58 @@ class RiskManager:
                         enforced_sl, self.mandatory_sl_pct)
         trade = {**trade, "sl_price": enforced_sl}
 
+        # 8. P2.6 — minimum reward:risk ratio
+        ok, reason = self.check_min_rr(trade, entry_price, is_buy)
+        if not ok:
+            return False, reason, trade
+
         return True, "", trade
+
+    def check_min_rr(self, trade: dict, entry_price: float,
+                      is_buy: bool) -> tuple[bool, str]:
+        """Reject entries whose reward:risk ratio is below MIN_RR (P2.6).
+
+        Long  R:R = (tp - entry) / (entry - sl)
+        Short R:R = (entry - tp) / (sl - entry)
+
+        Trades without a TP defined are not gated by this check — TP is
+        recommended but not mandatory (SL is). Allowing TP=None preserves
+        the existing behaviour where the LLM can leave a position open-ended.
+        """
+        try:
+            tp_raw = trade.get("tp_price")
+            sl_raw = trade.get("sl_price")
+        except Exception:
+            return True, ""
+        if tp_raw is None:
+            return True, ""  # no TP defined — nothing to gate against
+        try:
+            tp = float(tp_raw)
+            sl = float(sl_raw)
+            entry = float(entry_price)
+        except (TypeError, ValueError):
+            return True, ""  # malformed values — skip rather than block
+
+        if is_buy:
+            risk = entry - sl
+            reward = tp - entry
+        else:
+            risk = sl - entry
+            reward = entry - tp
+
+        if risk <= 0:
+            # SL on wrong side of entry — separate problem, not an R:R issue
+            return False, f"sl_wrong_side: entry={entry:.6f} sl={sl:.6f} ({'long' if is_buy else 'short'})"
+        if reward <= 0:
+            return False, f"tp_wrong_side: entry={entry:.6f} tp={tp:.6f} ({'long' if is_buy else 'short'})"
+
+        rr = reward / risk
+        if rr < self.min_rr:
+            return False, (
+                f"min_rr_not_met: {rr:.2f} < {self.min_rr} "
+                f"(entry={entry:.6f} tp={tp:.6f} sl={sl:.6f})"
+            )
+        return True, ""
 
     def get_risk_summary(self) -> dict:
         """Return current risk parameters for inclusion in LLM context."""
