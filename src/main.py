@@ -531,6 +531,7 @@ def main():
             market_sections = []
             asset_prices = {}
             asset_atr_ratios = {}  # S4: short/long ATR ratio for vol-scaled sizing
+            asset_vol_spike_5m = {}  # P2.7: 5m volume spike ratio for low-conviction gate
             for asset in args.assets:
                 try:
                     current_price = await hyperliquid.get_current_price(asset)
@@ -559,6 +560,8 @@ def main():
                         return round(vols[-1] / sma_v, 3)
                     vol_spike_5m = _vol_spike(candles_5m)
                     vol_spike_4h = _vol_spike(candles_4h)
+                    if vol_spike_5m is not None:
+                        asset_vol_spike_5m[asset] = vol_spike_5m
 
                     # S4: ATR ratio (short-term / long-term on 4h)
                     atr3_lt = latest(lt.get("atr3", []))
@@ -789,9 +792,13 @@ def main():
                                 }) + "\n")
                             continue
 
-                        # S4: Pass ATR ratio to risk manager for vol-scaled sizing
+                        # P2.1: Pass ATR ratio to risk manager for vol-scaled sizing
                         if asset in asset_atr_ratios:
                             output["atr_ratio"] = asset_atr_ratios[asset]
+
+                        # P2.7: Pass 5m vol_spike_ratio for low-conviction gate
+                        if asset in asset_vol_spike_5m:
+                            output["vol_spike_ratio"] = asset_vol_spike_5m[asset]
 
                         # S7: For HIP-3 assets, check orderbook liquidity. If
                         # spread > 0.5% or top-of-book depth < $500, cap the

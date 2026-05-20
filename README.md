@@ -30,13 +30,20 @@ All enforced in code, not just LLM prompts. Configurable via `.env`:
 | **Limit entries** | `ENTRY_ORDER_TYPE` | `limit` | Post-only limit orders by default; set `market` to revert to taker fills |
 | **Limit timeout** | `ENTRY_LIMIT_TIMEOUT_SEC` | `90` | Cancel unfilled limit entry after N seconds; no market fallback |
 | Max Position Size | `MAX_POSITION_PCT` | 20% | Single position capped at 20% of portfolio |
-| Force Close | `MAX_LOSS_PER_POSITION_PCT` | 20% | Auto-close positions at 20% loss (% of notional) |
+| **Force Close** | `MAX_LOSS_PER_POSITION_PCT` | 20% | Auto-close positions at 20% loss **of MARGIN** (P2.4 — was % of notional). At 10× leverage this triggers on a 2% adverse price move |
 | Max Leverage | `MAX_LEVERAGE` | 10× | Hard leverage cap |
 | Total Exposure | `MAX_TOTAL_EXPOSURE_PCT` | 80% | All positions combined capped at 80% of portfolio |
 | Daily Circuit Breaker | `DAILY_LOSS_CIRCUIT_BREAKER_PCT` | 25% | Stops new trades at 25% daily drawdown |
-| Mandatory Stop-Loss | `MANDATORY_SL_PCT` | 5% | Auto-set SL if LLM doesn't provide one |
+| Mandatory Stop-Loss | `MANDATORY_SL_PCT` | 5% | Auto-set SL if LLM doesn't provide one (P2.3: rounded to asset-aware price precision, not 2 decimals) |
 | Max Positions | `MAX_CONCURRENT_POSITIONS` | 10 | Concurrent position limit |
 | Balance Reserve | `MIN_BALANCE_RESERVE_PCT` | 10% | Don't trade below 10% of initial balance |
+| **ATR vol thresholds** | `ATR_RATIO_HIGH` / `ATR_RATIO_LOW` | 1.5 / 0.7 | atr_ratio = atr3/atr14 on 4h. Above HIGH → high-vol regime; below LOW → low-vol regime (P2.1) |
+| **High-vol size mult** | `LOW_SIZE_MULT` | 0.5 | Allocation × 0.5 when atr_ratio > ATR_RATIO_HIGH (P2.1) |
+| **Low-vol size mult** | `HIGH_SIZE_MULT` | 1.0 | Allocation × 1.0 when atr_ratio < ATR_RATIO_LOW — **NO boost above cap** (P2.1) |
+| **Min reward:risk** | `MIN_RR` | 1.5 | Reject entries with R:R below this. TP=null bypasses the gate (P2.6) |
+| **Min volume conviction** | `MIN_VOL_SPIKE_RATIO` | 0.5 | Block new entries when 5m vol_spike_ratio < 0.5 (dead-tape filter, P2.7) |
+| Sharpe sample gate | `MIN_SHARPE_SAMPLE` | 10 | Don't compute Sharpe until this many closed trades exist (P2.5) |
+| Sharpe window | `SHARPE_WINDOW` | 50 | Most-recent closed trades used in Sharpe (P2.5) |
 
 ## Setup
 

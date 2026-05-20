@@ -211,6 +211,38 @@ class RiskManager:
         return True, ""
 
     # ------------------------------------------------------------------
+    # P2.7 — Low-conviction volume gate
+    # ------------------------------------------------------------------
+
+    def check_volume_conviction(self, trade: dict) -> tuple[bool, str]:
+        """Block new entries when the entry-timeframe vol_spike_ratio is dead.
+
+        The 45h live run repeatedly showed the LLM identifying "catastrophically
+        weak volume" / "dead tape" conditions and trading anyway. The data is
+        already in the LLM prompt — this gate just enforces it.
+
+        Reads ``trade["vol_spike_ratio"]`` (the primary timeframe ratio, set by
+        main.py before calling validate_trade). When the field is missing or
+        unparseable, the gate is bypassed — do NOT reject for missing data,
+        only for confirmed-low data.
+        """
+        raw = trade.get("vol_spike_ratio")
+        if raw is None:
+            return True, ""  # missing — bypass, don't manufacture a block
+        try:
+            ratio = float(raw)
+        except (TypeError, ValueError):
+            return True, ""
+        if ratio <= 0:
+            return True, ""  # zero / negative is "no data", not "low vol"
+        if ratio < self.min_vol_spike_ratio:
+            return False, (
+                f"low_conviction_volume: {ratio:.2f} < {self.min_vol_spike_ratio} "
+                f"(entry-timeframe vol_spike_ratio)"
+            )
+        return True, ""
+
+    # ------------------------------------------------------------------
     # P1.2 — Cooldown guard
     # ------------------------------------------------------------------
 
@@ -503,6 +535,11 @@ class RiskManager:
 
         # P1.1 — stacking guard (hard block, no scale-in carve-out)
         ok, reason = self.check_stacking(coin, is_buy, positions)
+        if not ok:
+            return False, reason, trade
+
+        # P2.7 — low-conviction volume gate (block entries on dead tape)
+        ok, reason = self.check_volume_conviction(trade)
         if not ok:
             return False, reason, trade
 
