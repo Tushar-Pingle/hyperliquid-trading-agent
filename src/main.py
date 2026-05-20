@@ -7,6 +7,7 @@ sys.path.append(str(pathlib.Path(__file__).parent.parent))
 from src.agent.decision_maker import TradingAgent
 from src.indicators.local_indicators import compute_all, last_n, latest
 from src.risk_manager import RiskManager, normalize_coin
+from src.exit_evaluator import evaluate_exit_rules, build_snapshot
 from src.trading.hyperliquid_api import HyperliquidAPI
 import asyncio
 import logging
@@ -495,42 +496,51 @@ def main():
                     add_event(f"Data gather error {asset}: {e}")
                     continue
 
-            # --- S3: Continuous exit-condition checking ---
-            # Before asking the LLM, evaluate each active trade's exit_plan
-            # against current indicators. If invalidated, market-close and
-            # cancel its TP/SL — removes the LLM-talking-itself-back-in
-            # failure mode.
+            # --- P2.2: Structured exit-rule evaluation ---
+            # Replaces the old S3 text-parsing check_exit_condition (kept as a
+            # standalone helper below for reference but no longer wired in).
+            # For each active trade with exit_rules, look up the per-asset
+            # market_section, flatten it to a snapshot dict, and evaluate.
+            # ANY rule matches → market-close.  Trades without exit_rules
+            # fall back to TP/SL-only forever (no grace period that flips
+            # to "fail closed") — the LLM was given the schema and chose
+            # not to use it. We log exit_rules_missing on entry, not here.
+            market_by_asset = {s["asset"]: s for s in market_sections if isinstance(s, dict)}
             for tr in active_trades[:]:
                 try:
-                    if not tr.get('exit_plan'):
+                    rules = tr.get("exit_rules") or []
+                    asset = tr.get("asset")
+                    if not asset or not rules:
                         continue
-                    asset = tr.get('asset')
-                    if not asset:
-                        continue
-                    should_exit = await check_exit_condition(tr, hyperliquid)
+                    msec = market_by_asset.get(asset)
+                    if not msec:
+                        continue  # no market data this cycle — cannot evaluate
+                    snap = build_snapshot(msec, current_price=msec.get("current_price"))
+                    should_exit, reason = evaluate_exit_rules(rules, snap)
                     if not should_exit:
                         continue
-                    add_event(f"S3 EXIT {asset}: invalidation triggered by exit_plan — closing")
+                    add_event(f"P2.2 EXIT {asset}: {reason} — closing")
                     try:
-                        amt = abs(float(tr.get('amount') or 0))
+                        amt = abs(float(tr.get("amount") or 0))
                         if amt > 0:
-                            if tr.get('is_long'):
+                            if tr.get("is_long"):
                                 await hyperliquid.place_sell_order(asset, amt)
                             else:
                                 await hyperliquid.place_buy_order(asset, amt)
                         await hyperliquid.cancel_all_orders(asset)
-                        risk_mgr.record_cooldown(asset, "exit_invalidation")  # P1.2
+                        risk_mgr.record_cooldown(asset, "exit_rule_triggered")
                         active_trades.remove(tr)
                         save_active_trades()
                         with open(diary_path, "a") as f:
                             f.write(json.dumps({
                                 "timestamp": datetime.now(timezone.utc).isoformat(),
                                 "asset": asset,
-                                "action": "exit_invalidation",
-                                "exit_plan": tr.get('exit_plan'),
+                                "action": "exit_rule_triggered",
+                                "rule_reason": reason,
+                                "exit_rules": rules,
                             }) + "\n")
                     except Exception as ex:
-                        add_event(f"S3 exit close failed for {asset}: {ex}")
+                        add_event(f"P2.2 exit close failed for {asset}: {ex}")
                 except Exception:
                     continue
 
@@ -1059,6 +1069,15 @@ def main():
                                         active_trades.remove(existing)
                                     except ValueError:
                                         pass
+                            # P2.2: persist structured exit_rules with each active trade.
+                            # Empty list = no structured invalidation; the trade falls
+                            # back to TP/SL-only permanently. Log exit_rules_missing
+                            # once on entry so the diary captures how often the LLM
+                            # skipped the schema.
+                            exit_rules = output.get("exit_rules") or []
+                            if not isinstance(exit_rules, list):
+                                exit_rules = []
+                            has_exit_rules = bool(exit_rules)
                             active_trades.append({
                                 "asset": asset,
                                 "is_long": is_buy,
@@ -1067,11 +1086,21 @@ def main():
                                 "tp_oid": tp_oid,
                                 "sl_oid": sl_oid,
                                 "exit_plan": output["exit_plan"],
+                                "exit_rules": exit_rules,
                                 "entry_thesis": output.get("rationale", "") or "",  # S8
                                 "opened_at": datetime.now(timezone.utc).isoformat()
                             })
                             save_active_trades()  # H5
                             risk_mgr.record_cooldown(asset, action)  # P1.2
+                            if not has_exit_rules:
+                                add_event(f"P2.2 {asset}: exit_rules_missing — falling back to TP/SL only")
+                                with open(diary_path, "a") as f:
+                                    f.write(json.dumps({
+                                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                                        "asset": asset,
+                                        "action": "exit_rules_missing",
+                                        "fallback": "tp_sl_only",
+                                    }) + "\n")
                             if rationale:
                                 add_event(f"Post-trade rationale for {asset}: {rationale}")
                             with open(diary_path, "a") as f:

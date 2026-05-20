@@ -89,9 +89,16 @@ class TradingAgent:
             "- Output ONLY a strict JSON object (no markdown, no code fences) with exactly two properties:\n"
             "  • \"reasoning\": long-form string capturing detailed, step-by-step analysis.\n"
             "  • \"trade_decisions\": array ordered to match the provided assets list.\n"
-            "- Each item inside trade_decisions must contain the keys: asset, action, allocation_usd, order_type, limit_price, tp_price, sl_price, exit_plan, rationale.\n"
+            "- Each item inside trade_decisions must contain the keys: asset, action, allocation_usd, order_type, limit_price, tp_price, sl_price, exit_plan, exit_rules, rationale.\n"
             "  • order_type: \"market\" (default) or \"limit\"\n"
             "  • limit_price: required if order_type is \"limit\", null otherwise\n"
+            "  • exit_rules (P2.2): structured invalidation conditions evaluated automatically every cycle. An array of {indicator, comparator, value} objects; ANY match triggers a market close. Use [] when you have no hard invalidation beyond TP/SL.\n"
+            "    - indicator names: \"price\", or any numeric indicator from market_data with a timeframe suffix: macd_4h, rsi14_4h, rsi14_5m, ema20_4h, ema20_5m, ema50_4h, atr14_4h, atr3_4h, vol_spike_ratio_5m, vol_spike_ratio_4h\n"
+            "    - comparator: one of \"<\", \">\", \"<=\", \">=\"\n"
+            "    - value: numeric threshold\n"
+            "    - Example for a long: [{\"indicator\":\"macd_4h\",\"comparator\":\"<\",\"value\":-200},{\"indicator\":\"price\",\"comparator\":\"<\",\"value\":59500}]\n"
+            "    - Example for a short: [{\"indicator\":\"rsi14_5m\",\"comparator\":\"<\",\"value\":30}]\n"
+            "    Use exit_rules for HARD invalidation only — not soft thesis-decay. Soft decay belongs in exit_plan/rationale.\n"
             "- Do not emit Markdown or any extra properties.\n"
         )
 
@@ -351,6 +358,9 @@ class TradingAgent:
                             item.setdefault("tp_price", None)
                             item.setdefault("sl_price", None)
                             item.setdefault("exit_plan", "")
+                            item.setdefault("exit_rules", [])
+                            if not isinstance(item.get("exit_rules"), list):
+                                item["exit_rules"] = []
                             item.setdefault("rationale", "")
                             normalized.append(item)
                     return {"reasoning": reasoning_text, "trade_decisions": normalized}
