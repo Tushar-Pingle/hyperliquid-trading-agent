@@ -41,9 +41,10 @@ class TradingAgent:
             "Volume context (per asset): each market_data entry now includes vol_spike_ratio = current bar volume / 20-bar SMA volume on both 5m and 4h. Avoid initiating new entries when 5m vol_spike_ratio < 0.7 — low-conviction tape produces whipsaws. A 5m spike > 2.0 with aligned direction is a real-time momentum confirmation.\n\n"
             "Volatility-scaled sizing: market_data.long_term.atr_ratio_short_over_long = atr3/atr14 on 4h. >1.5 means short-term vol is much higher than baseline (regime expansion → risk manager will shrink allocation by 30%); <0.7 means dead-tape contraction (risk manager will allow 20% more). Plan TP/SL distances accordingly.\n\n"
             "HIP-3 weekend freeze: assets prefixed with a colon (e.g. xyz:CL, xyz:GOLD) are HIP-3 perp dexes whose oracle freezes Fri 16:50 → Sun 22:00 UTC. market_data.<asset>.hip3_market_frozen flags this. During the freeze the system hard-blocks new HIP-3 entries and auto-closes existing HIP-3 positions; do NOT plan entries that depend on price action inside the freeze window.\n\n"
-            "TP/SL placement (S6): Do not pick arbitrary 1-2% targets — those get wicked through on 5m bars. Anchor BOTH TP and SL to structure plus ATR:\n"
+            "TP/SL placement (P2.6): Do not pick arbitrary 1-2% targets — those get wicked through on 5m bars. Anchor BOTH TP and SL to structure plus ATR:\n"
             "  • TP: next swing high/low OR ema50 ± ~1×ATR(14, 4h) in the direction of the trade, whichever is more conservative.\n"
             "  • SL: most recent opposite swing point ± ~0.5×ATR(14, 4h) (i.e. invalidation of the structural setup).\n"
+            "  HARD GATE: the risk manager rejects any entry whose reward:risk ratio is below MIN_RR (default 1.5). For longs that's (tp-entry)/(entry-sl) >= 1.5; for shorts (entry-tp)/(sl-entry) >= 1.5. Plan TP/SL such that R:R clears this bar, or skip the trade — a too-tight TP will get the entry rejected and you'll miss the move entirely.\n"
             "  This keeps R:R coherent across regimes; in calm tape that means tighter TPs, in expansion regimes that means wider stops.\n\n"
             "Funding-carry mode (S5): When |funding_annualized_pct| > 30% AND signals are neutral (5m RSI14 in 40-60 AND |4h macd| small relative to atr14), you may open a SMALL contra-funding position purely to harvest the carry. Size at most 0.4× a normal directional allocation, set SL at ~0.75×ATR(14, 4h) from entry, set TP wide (or null) since the edge is funding not price. Rationale should clearly say 'carry trade'. Skip this mode if HIP-3 is frozen for that asset or if 4h ATR is expanding (atr_ratio_short_over_long > 1.3) — funding edge isn't worth getting steamrolled by a directional move.\n\n"
             "Thesis-decay (S8): each active trade now carries an entry_thesis (the rationale you wrote when you opened it). On every cycle, RE-EVALUATE whether the original entry_thesis is still true. If the structural premise has broken (e.g., thesis said '4h MACD bearish' and 4h MACD is now positive) — close the position at market BEFORE TP/SL even if no hard invalidation has fired yet. Don't wait for the stop to take you out when your reason for being in the trade is gone.\n\n"
@@ -88,9 +89,16 @@ class TradingAgent:
             "- Output ONLY a strict JSON object (no markdown, no code fences) with exactly two properties:\n"
             "  • \"reasoning\": long-form string capturing detailed, step-by-step analysis.\n"
             "  • \"trade_decisions\": array ordered to match the provided assets list.\n"
-            "- Each item inside trade_decisions must contain the keys: asset, action, allocation_usd, order_type, limit_price, tp_price, sl_price, exit_plan, rationale.\n"
+            "- Each item inside trade_decisions must contain the keys: asset, action, allocation_usd, order_type, limit_price, tp_price, sl_price, exit_plan, exit_rules, rationale.\n"
             "  • order_type: \"market\" (default) or \"limit\"\n"
             "  • limit_price: required if order_type is \"limit\", null otherwise\n"
+            "  • exit_rules (P2.2): structured invalidation conditions evaluated automatically every cycle. An array of {indicator, comparator, value} objects; ANY match triggers a market close. Use [] when you have no hard invalidation beyond TP/SL.\n"
+            "    - indicator names: \"price\", or any numeric indicator from market_data with a timeframe suffix: macd_4h, rsi14_4h, rsi14_5m, ema20_4h, ema20_5m, ema50_4h, atr14_4h, atr3_4h, vol_spike_ratio_5m, vol_spike_ratio_4h\n"
+            "    - comparator: one of \"<\", \">\", \"<=\", \">=\"\n"
+            "    - value: numeric threshold\n"
+            "    - Example for a long: [{\"indicator\":\"macd_4h\",\"comparator\":\"<\",\"value\":-200},{\"indicator\":\"price\",\"comparator\":\"<\",\"value\":59500}]\n"
+            "    - Example for a short: [{\"indicator\":\"rsi14_5m\",\"comparator\":\"<\",\"value\":30}]\n"
+            "    Use exit_rules for HARD invalidation only — not soft thesis-decay. Soft decay belongs in exit_plan/rationale.\n"
             "- Do not emit Markdown or any extra properties.\n"
         )
 
@@ -350,6 +358,9 @@ class TradingAgent:
                             item.setdefault("tp_price", None)
                             item.setdefault("sl_price", None)
                             item.setdefault("exit_plan", "")
+                            item.setdefault("exit_rules", [])
+                            if not isinstance(item.get("exit_rules"), list):
+                                item["exit_rules"] = []
                             item.setdefault("rationale", "")
                             normalized.append(item)
                     return {"reasoning": reasoning_text, "trade_decisions": normalized}

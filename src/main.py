@@ -7,6 +7,7 @@ sys.path.append(str(pathlib.Path(__file__).parent.parent))
 from src.agent.decision_maker import TradingAgent
 from src.indicators.local_indicators import compute_all, last_n, latest
 from src.risk_manager import RiskManager, normalize_coin
+from src.exit_evaluator import evaluate_exit_rules, build_snapshot
 from src.trading.hyperliquid_api import HyperliquidAPI
 import asyncio
 import logging
@@ -89,6 +90,8 @@ def main():
     interval_sec = get_interval_seconds(args.interval)
     risk_mgr.set_interval(interval_sec)
     risk_mgr.load_cooldowns()
+    # P2.3 — asset-aware SL price rounding (DOGE-tier prices break with round(x,2))
+    risk_mgr.set_price_rounder(hyperliquid.round_price)
 
     # P1.3 — warn when loop interval is shorter than recommended (cuts fee drag)
     if interval_sec < 900:  # 15 m
@@ -101,7 +104,10 @@ def main():
 
     start_time = datetime.now(timezone.utc)
     invocation_count = 0
-    trade_log = []  # For Sharpe: list of returns
+    trade_log = []  # P2.5: closed-trade records loaded from TRADE_LOG_PATH
+    TRADE_LOG_PATH = "trade_log.jsonl"
+    SHARPE_WINDOW = int(CFG.get("sharpe_window") or 50)
+    MIN_SHARPE_SAMPLE = int(CFG.get("min_sharpe_sample") or 10)
     ACTIVE_TRADES_PATH = "active_trades.json"
     active_trades = []  # persisted to ACTIVE_TRADES_PATH — loaded/reconciled on startup
     recent_events = deque(maxlen=200)
@@ -124,6 +130,87 @@ def main():
         except Exception as e:
             logging.warning("Failed to save active_trades: %s", e)
 
+    def write_trade_log(record: dict) -> None:
+        """P2.5: append a closed-trade record to trade_log.jsonl + in-memory list.
+
+        Best-effort — disk failure logs a warning but never blocks the close
+        path. The file is append-only (one JSON per line) so it survives
+        restarts and is trivial to grep / re-aggregate.
+        """
+        try:
+            full = {"ts": datetime.now(timezone.utc).isoformat(), **record}
+            trade_log.append(full)
+            with open(TRADE_LOG_PATH, "a") as f:
+                f.write(json.dumps(full, default=str) + "\n")
+        except Exception as e:
+            logging.warning("P2.5: write_trade_log failed (non-fatal): %s", e)
+
+    def _try_record_close(asset, active_tr, exit_price, pnl, close_reason,
+                           margin=None, leverage=None, leverage_fallback=False):
+        """Best-effort helper to record a close. Pulls entry / size / opened_at
+        from the matching active_trade record when present so the close site
+        only has to supply what it directly knows.
+        """
+        try:
+            entry_price = None
+            size = None
+            opened_at = None
+            is_long = None
+            if isinstance(active_tr, dict):
+                entry_price = active_tr.get("entry_price")
+                size = active_tr.get("amount")
+                opened_at = active_tr.get("opened_at")
+                is_long = active_tr.get("is_long")
+            duration_sec = None
+            if opened_at:
+                try:
+                    opened_dt = datetime.fromisoformat(str(opened_at).replace("Z", "+00:00"))
+                    if opened_dt.tzinfo is None:
+                        opened_dt = opened_dt.replace(tzinfo=timezone.utc)
+                    duration_sec = (datetime.now(timezone.utc) - opened_dt).total_seconds()
+                except Exception:
+                    duration_sec = None
+            # Compute margin if not provided: notional / leverage (P2.4)
+            if margin is None and entry_price and size:
+                lev = leverage if leverage and leverage > 0 else float(CFG.get("max_leverage") or 10)
+                margin = abs(float(size)) * float(entry_price) / lev
+            write_trade_log({
+                "asset": asset,
+                "side": "long" if is_long else ("short" if is_long is False else None),
+                "entry_price": entry_price,
+                "exit_price": exit_price,
+                "size": size,
+                "pnl": pnl,
+                "margin": margin,
+                "leverage": leverage,
+                "leverage_fallback": leverage_fallback,
+                "duration_sec": duration_sec,
+                "close_reason": close_reason,
+            })
+        except Exception as e:
+            logging.warning("P2.5: _try_record_close failed (non-fatal): %s", e)
+
+    def load_trade_log() -> None:
+        """P2.5: load recent closed-trade records from disk at startup."""
+        try:
+            with open(TRADE_LOG_PATH) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        trade_log.append(json.loads(line))
+                    except Exception:
+                        continue
+            # Keep only the last SHARPE_WINDOW records in memory (file remains complete)
+            if len(trade_log) > SHARPE_WINDOW:
+                del trade_log[:-SHARPE_WINDOW]
+            logging.info("P2.5: Loaded %d trade-log record(s)", len(trade_log))
+        except FileNotFoundError:
+            logging.info("P2.5: No trade_log.jsonl found (first run)")
+        except Exception as e:
+            logging.warning("P2.5: Failed to load trade_log (starting fresh): %s", e)
+
     async def run_loop():
         """Main trading loop that gathers data, calls the agent, and executes trades."""
         nonlocal invocation_count, initial_account_value
@@ -138,6 +225,9 @@ def main():
         for dex in hip3_dexes:
             await hyperliquid.get_meta_and_ctxs(dex=dex)
             add_event(f"Loaded HIP-3 meta for dex: {dex}")
+
+        # P2.5: Load trade-log history for Sharpe computation
+        load_trade_log()
 
         # H5: Load persisted active_trades and reconcile against live exchange state
         try:
@@ -223,7 +313,12 @@ def main():
                     coin = ptc["coin"]
                     size = ptc["size"]
                     is_long = ptc["is_long"]
-                    add_event(f"RISK FORCE-CLOSE: {coin} at {ptc['loss_pct']}% loss (PnL: ${ptc['pnl']})")
+                    add_event(
+                        f"RISK FORCE-CLOSE: {coin} margin-loss {ptc['loss_pct']}% "
+                        f"(pnl=${ptc['pnl']}, margin=${ptc.get('margin', 0)}, "
+                        f"lev={ptc.get('leverage', '?')}x"
+                        f"{' [fallback]' if ptc.get('leverage_fallback') else ''})"
+                    )
                     try:
                         if is_long:
                             await hyperliquid.place_sell_order(coin, size)
@@ -231,11 +326,21 @@ def main():
                             await hyperliquid.place_buy_order(coin, size)
                         await hyperliquid.cancel_all_orders(coin)
                         risk_mgr.record_cooldown(coin, "force_close")  # P1.2
-                        # Remove from active trades
+                        # Remove from active trades + record to trade log (P2.5)
+                        matched_tr = None
                         for tr in active_trades[:]:
                             if tr.get('asset') == coin:
+                                matched_tr = tr
                                 active_trades.remove(tr)
                         save_active_trades()  # H5
+                        exit_px = await hyperliquid.get_current_price(coin)
+                        _try_record_close(
+                            coin, matched_tr, exit_px, ptc["pnl"],
+                            "force_close",
+                            margin=ptc.get("margin"),
+                            leverage=ptc.get("leverage"),
+                            leverage_fallback=ptc.get("leverage_fallback", False),
+                        )
                         with open(diary_path, "a") as f:
                             f.write(json.dumps({
                                 "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -243,6 +348,9 @@ def main():
                                 "action": "risk_force_close",
                                 "loss_pct": ptc["loss_pct"],
                                 "pnl": ptc["pnl"],
+                                "margin": ptc.get("margin"),
+                                "leverage": ptc.get("leverage"),
+                                "leverage_fallback": ptc.get("leverage_fallback", False),
                             }) + "\n")
                     except Exception as fc_err:
                         add_event(f"Force-close error for {coin}: {fc_err}")
@@ -272,10 +380,18 @@ def main():
                             await hyperliquid.place_buy_order(coin, abs(size))
                         await hyperliquid.cancel_all_orders(coin)
                         risk_mgr.record_cooldown(coin, "weekend_close")  # P1.2
+                        matched_tr = None
                         for tr in active_trades[:]:
                             if tr.get('asset') == coin:
+                                matched_tr = tr
                                 active_trades.remove(tr)
                         save_active_trades()
+                        # P2.5: record close
+                        exit_px = await hyperliquid.get_current_price(coin)
+                        _try_record_close(
+                            coin, matched_tr, exit_px, pos.get("pnl"),
+                            "weekend_close",
+                        )
                         with open(diary_path, "a") as f:
                             f.write(json.dumps({
                                 "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -334,6 +450,10 @@ def main():
                         tr['_orphan_cycles'] = tr.get('_orphan_cycles', 0) + 1
                         if tr['_orphan_cycles'] >= ORPHAN_CYCLES_REQUIRED:
                             add_event(f"Reconciling stale active trade for {asset} (orphan for {tr['_orphan_cycles']} cycles)")
+                            # P2.5: record close. PnL unknown (filled outside our path —
+                            # SL/TP trigger or manual close); leave pnl=None so the
+                            # Sharpe calc skips it but the entry/exit attempt is logged.
+                            _try_record_close(asset, tr, None, None, "reconcile_close")
                             active_trades.remove(tr)
                             save_active_trades()  # H5
                             with open(diary_path, "a") as f:
@@ -411,6 +531,7 @@ def main():
             market_sections = []
             asset_prices = {}
             asset_atr_ratios = {}  # S4: short/long ATR ratio for vol-scaled sizing
+            asset_vol_spike_5m = {}  # P2.7: 5m volume spike ratio for low-conviction gate
             for asset in args.assets:
                 try:
                     current_price = await hyperliquid.get_current_price(asset)
@@ -439,6 +560,8 @@ def main():
                         return round(vols[-1] / sma_v, 3)
                     vol_spike_5m = _vol_spike(candles_5m)
                     vol_spike_4h = _vol_spike(candles_4h)
+                    if vol_spike_5m is not None:
+                        asset_vol_spike_5m[asset] = vol_spike_5m
 
                     # S4: ATR ratio (short-term / long-term on 4h)
                     atr3_lt = latest(lt.get("atr3", []))
@@ -485,42 +608,60 @@ def main():
                     add_event(f"Data gather error {asset}: {e}")
                     continue
 
-            # --- S3: Continuous exit-condition checking ---
-            # Before asking the LLM, evaluate each active trade's exit_plan
-            # against current indicators. If invalidated, market-close and
-            # cancel its TP/SL — removes the LLM-talking-itself-back-in
-            # failure mode.
+            # --- P2.2: Structured exit-rule evaluation ---
+            # Replaces the old S3 text-parsing check_exit_condition (kept as a
+            # standalone helper below for reference but no longer wired in).
+            # For each active trade with exit_rules, look up the per-asset
+            # market_section, flatten it to a snapshot dict, and evaluate.
+            # ANY rule matches → market-close.  Trades without exit_rules
+            # fall back to TP/SL-only forever (no grace period that flips
+            # to "fail closed") — the LLM was given the schema and chose
+            # not to use it. We log exit_rules_missing on entry, not here.
+            market_by_asset = {s["asset"]: s for s in market_sections if isinstance(s, dict)}
             for tr in active_trades[:]:
                 try:
-                    if not tr.get('exit_plan'):
+                    rules = tr.get("exit_rules") or []
+                    asset = tr.get("asset")
+                    if not asset or not rules:
                         continue
-                    asset = tr.get('asset')
-                    if not asset:
-                        continue
-                    should_exit = await check_exit_condition(tr, hyperliquid)
+                    msec = market_by_asset.get(asset)
+                    if not msec:
+                        continue  # no market data this cycle — cannot evaluate
+                    snap = build_snapshot(msec, current_price=msec.get("current_price"))
+                    should_exit, reason = evaluate_exit_rules(rules, snap)
                     if not should_exit:
                         continue
-                    add_event(f"S3 EXIT {asset}: invalidation triggered by exit_plan — closing")
+                    add_event(f"P2.2 EXIT {asset}: {reason} — closing")
                     try:
-                        amt = abs(float(tr.get('amount') or 0))
+                        amt = abs(float(tr.get("amount") or 0))
                         if amt > 0:
-                            if tr.get('is_long'):
+                            if tr.get("is_long"):
                                 await hyperliquid.place_sell_order(asset, amt)
                             else:
                                 await hyperliquid.place_buy_order(asset, amt)
                         await hyperliquid.cancel_all_orders(asset)
-                        risk_mgr.record_cooldown(asset, "exit_invalidation")  # P1.2
+                        risk_mgr.record_cooldown(asset, "exit_rule_triggered")
+                        # P2.5: record close before removing
+                        exit_px = msec.get("current_price")
+                        # find live pnl from state if available this cycle
+                        _pnl = None
+                        for _p in state.get("positions", []):
+                            if _p.get("coin") == asset:
+                                _pnl = _p.get("pnl")
+                                break
+                        _try_record_close(asset, tr, exit_px, _pnl, "exit_rule_triggered")
                         active_trades.remove(tr)
                         save_active_trades()
                         with open(diary_path, "a") as f:
                             f.write(json.dumps({
                                 "timestamp": datetime.now(timezone.utc).isoformat(),
                                 "asset": asset,
-                                "action": "exit_invalidation",
-                                "exit_plan": tr.get('exit_plan'),
+                                "action": "exit_rule_triggered",
+                                "rule_reason": reason,
+                                "exit_rules": rules,
                             }) + "\n")
                     except Exception as ex:
-                        add_event(f"S3 exit close failed for {asset}: {ex}")
+                        add_event(f"P2.2 exit close failed for {asset}: {ex}")
                 except Exception:
                     continue
 
@@ -651,9 +792,13 @@ def main():
                                 }) + "\n")
                             continue
 
-                        # S4: Pass ATR ratio to risk manager for vol-scaled sizing
+                        # P2.1: Pass ATR ratio to risk manager for vol-scaled sizing
                         if asset in asset_atr_ratios:
                             output["atr_ratio"] = asset_atr_ratios[asset]
+
+                        # P2.7: Pass 5m vol_spike_ratio for low-conviction gate
+                        if asset in asset_vol_spike_5m:
+                            output["vol_spike_ratio"] = asset_vol_spike_5m[asset]
 
                         # S7: For HIP-3 assets, check orderbook liquidity. If
                         # spread > 0.5% or top-of-book depth < $500, cap the
@@ -750,11 +895,19 @@ def main():
                                                 "new_side": new_side,
                                             }) + "\n")
                                         continue
-                                    # Remove stale active_trade entry
+                                    # Remove stale active_trade entry + record close (P2.5)
+                                    matched_tr = None
                                     for tr in active_trades[:]:
                                         if tr.get('asset') == asset:
+                                            matched_tr = tr
                                             active_trades.remove(tr)
                                     save_active_trades()  # H5
+                                    _flip_pnl = None
+                                    for _p in state.get("positions", []):
+                                        if _p.get("coin") == asset:
+                                            _flip_pnl = _p.get("pnl")
+                                            break
+                                    _try_record_close(asset, matched_tr, current_price, _flip_pnl, "flip_close")
                                     risk_mgr.record_cooldown(asset, "flip")  # P1.2
                                     with open(diary_path, "a") as f:
                                         f.write(json.dumps({
@@ -1049,6 +1202,15 @@ def main():
                                         active_trades.remove(existing)
                                     except ValueError:
                                         pass
+                            # P2.2: persist structured exit_rules with each active trade.
+                            # Empty list = no structured invalidation; the trade falls
+                            # back to TP/SL-only permanently. Log exit_rules_missing
+                            # once on entry so the diary captures how often the LLM
+                            # skipped the schema.
+                            exit_rules = output.get("exit_rules") or []
+                            if not isinstance(exit_rules, list):
+                                exit_rules = []
+                            has_exit_rules = bool(exit_rules)
                             active_trades.append({
                                 "asset": asset,
                                 "is_long": is_buy,
@@ -1057,11 +1219,21 @@ def main():
                                 "tp_oid": tp_oid,
                                 "sl_oid": sl_oid,
                                 "exit_plan": output["exit_plan"],
+                                "exit_rules": exit_rules,
                                 "entry_thesis": output.get("rationale", "") or "",  # S8
                                 "opened_at": datetime.now(timezone.utc).isoformat()
                             })
                             save_active_trades()  # H5
                             risk_mgr.record_cooldown(asset, action)  # P1.2
+                            if not has_exit_rules:
+                                add_event(f"P2.2 {asset}: exit_rules_missing — falling back to TP/SL only")
+                                with open(diary_path, "a") as f:
+                                    f.write(json.dumps({
+                                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                                        "asset": asset,
+                                        "action": "exit_rules_missing",
+                                        "fallback": "tp_sl_only",
+                                    }) + "\n")
                             if rationale:
                                 add_event(f"Post-trade rationale for {asset}: {rationale}")
                             with open(diary_path, "a") as f:
@@ -1169,13 +1341,29 @@ def main():
         current = state['balance'] + sum(p.get('pnl', 0) for p in state.get('positions', []))
         return ((current - initial) / initial) * 100 if initial else 0
 
-    def calculate_sharpe(returns):
-        """Compute a naive Sharpe-like ratio from the trade log."""
-        if not returns:
-            return 0
-        vals = [r.get('pnl', 0) if 'pnl' in r else 0 for r in returns]
-        if not vals:
-            return 0
+    def calculate_sharpe(records):
+        """Compute Sharpe from closed-trade records using pnl/margin returns (P2.5).
+
+        Returns None until ``len(records) >= MIN_SHARPE_SAMPLE``; first cycles
+        after a deploy otherwise show meaningless numbers from 1-2 trades.
+
+        Each record must have ``pnl`` and ``margin`` (recorded by
+        _try_record_close). Records missing either field are skipped.
+        """
+        if not records:
+            return None
+        vals = []
+        for r in records:
+            pnl = r.get("pnl")
+            margin = r.get("margin")
+            if pnl is None or margin is None or margin == 0:
+                continue
+            try:
+                vals.append(float(pnl) / float(margin))
+            except (TypeError, ValueError, ZeroDivisionError):
+                continue
+        if len(vals) < MIN_SHARPE_SAMPLE:
+            return None
         mean = sum(vals) / len(vals)
         var = sum((v - mean) ** 2 for v in vals) / len(vals)
         std = math.sqrt(var) if var > 0 else 0

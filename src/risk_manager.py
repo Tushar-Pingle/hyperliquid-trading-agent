@@ -61,10 +61,26 @@ class RiskManager:
         # P1.1 — stacking guard
         self.allow_scale_in = bool(CONFIG.get("stacking_allow_scale_in", False))
 
+        # P2.1 — ATR-scaled sizing thresholds (env-driven, no hardcoded magic numbers)
+        self.atr_ratio_high = float(CONFIG.get("atr_ratio_high") or 1.5)
+        self.atr_ratio_low = float(CONFIG.get("atr_ratio_low") or 0.7)
+        self.atr_low_size_mult = float(CONFIG.get("atr_low_size_mult") or 0.5)
+        self.atr_high_size_mult = float(CONFIG.get("atr_high_size_mult") or 1.0)
+
+        # P2.6 — minimum reward:risk on entries
+        self.min_rr = float(CONFIG.get("min_rr") or 1.5)
+
+        # P2.7 — low-conviction volume gate
+        self.min_vol_spike_ratio = float(CONFIG.get("min_vol_spike_ratio") or 0.5)
+
         # P1.2 — per-asset cooldown
         self.cooldown_bars = int(CONFIG.get("cooldown_bars") or 3)
         self.interval_sec = 300.0  # default 5 m; set by set_interval() after arg parsing
         self._cooldowns: dict = {}  # {canonical_coin: {last_action_ts, last_action}}
+
+        # P2.3 — asset-aware price precision. Set by main() via set_price_rounder().
+        # Signature: (asset: str, price: float) -> float
+        self._price_rounder = None
 
         # Daily tracking
         self.daily_high_value = None
@@ -78,6 +94,14 @@ class RiskManager:
 
     def set_interval(self, interval_sec: float) -> None:
         self.interval_sec = float(interval_sec)
+
+    def set_price_rounder(self, rounder) -> None:
+        """Install an asset-aware price-rounding callable (P2.3).
+
+        ``rounder(asset, price) -> float``. When unset, ``enforce_stop_loss``
+        falls back to 2-decimal rounding for backward compatibility.
+        """
+        self._price_rounder = rounder
 
     # ------------------------------------------------------------------
     # Cooldown persistence — P1.2
@@ -184,6 +208,38 @@ class RiskManager:
                     f"stacking_blocked: {canonical} already has a {direction} "
                     f"position (szi={szi:.6f})"
                 )
+        return True, ""
+
+    # ------------------------------------------------------------------
+    # P2.7 — Low-conviction volume gate
+    # ------------------------------------------------------------------
+
+    def check_volume_conviction(self, trade: dict) -> tuple[bool, str]:
+        """Block new entries when the entry-timeframe vol_spike_ratio is dead.
+
+        The 45h live run repeatedly showed the LLM identifying "catastrophically
+        weak volume" / "dead tape" conditions and trading anyway. The data is
+        already in the LLM prompt — this gate just enforces it.
+
+        Reads ``trade["vol_spike_ratio"]`` (the primary timeframe ratio, set by
+        main.py before calling validate_trade). When the field is missing or
+        unparseable, the gate is bypassed — do NOT reject for missing data,
+        only for confirmed-low data.
+        """
+        raw = trade.get("vol_spike_ratio")
+        if raw is None:
+            return True, ""  # missing — bypass, don't manufacture a block
+        try:
+            ratio = float(raw)
+        except (TypeError, ValueError):
+            return True, ""
+        if ratio <= 0:
+            return True, ""  # zero / negative is "no data", not "low vol"
+        if ratio < self.min_vol_spike_ratio:
+            return False, (
+                f"low_conviction_volume: {ratio:.2f} < {self.min_vol_spike_ratio} "
+                f"(entry-timeframe vol_spike_ratio)"
+            )
         return True, ""
 
     # ------------------------------------------------------------------
@@ -332,16 +388,24 @@ class RiskManager:
     # ------------------------------------------------------------------
 
     def enforce_stop_loss(self, sl_price: float | None, entry_price: float,
-                           is_buy: bool) -> float:
-        """Ensure every trade has a stop-loss. Auto-set if missing."""
+                           is_buy: bool, asset: str = "") -> float:
+        """Ensure every trade has a stop-loss. Auto-set if missing.
+
+        Uses the asset-aware price rounder (P2.3) when available so a
+        low-priced asset (e.g. DOGE at 0.08) doesn't get its SL rounded to 0.08
+        away from a 0.0795 entry. Falls back to 2 decimals when the rounder
+        isn't installed (standalone tests / boot before main wiring).
+        """
         if sl_price is not None:
             return sl_price
-        # Auto-set SL at mandatory_sl_pct from entry
         sl_distance = entry_price * (self.mandatory_sl_pct / 100.0)
-        if is_buy:
-            return round(entry_price - sl_distance, 2)
-        else:
-            return round(entry_price + sl_distance, 2)
+        raw = entry_price - sl_distance if is_buy else entry_price + sl_distance
+        if self._price_rounder is not None and asset:
+            try:
+                return float(self._price_rounder(asset, raw))
+            except Exception as e:
+                logging.warning("RISK P2.3: price rounder failed for %s (%s); using 2-decimal fallback", asset, e)
+        return round(raw, 2)
 
     # ------------------------------------------------------------------
     # Force-close losing positions
@@ -350,10 +414,22 @@ class RiskManager:
     def check_losing_positions(self, positions: list[dict]) -> list[dict]:
         """Return positions that should be force-closed due to excessive loss.
 
+        P2.4: loss_pct is now ``|pnl| / margin``, not ``|pnl| / notional``.
+        Margin = notional / leverage. At 10× leverage a 2% adverse price move
+        is a 20% margin hit — and 20% is what MAX_LOSS_PER_POSITION_PCT now
+        means. The old formula understated loss by the leverage factor and
+        let positions run to a 100%+ margin loss before tripping.
+
+        Leverage source:
+          1. ``pos["leverage"]["value"]`` (cross OR isolated) — Hyperliquid
+             surfaces effective leverage here for both modes
+          2. Fallback when field missing/malformed: ``MAX_LEVERAGE`` from config
+             (NEVER 1.0 — that would under-trigger force-close on real positions)
+
         Args:
             positions: List of position dicts with keys:
                 coin/symbol, szi/quantity, entryPx/entry_price,
-                pnl/unrealized_pnl
+                pnl/unrealized_pnl, leverage
 
         Returns:
             List of positions that exceed the max loss threshold.
@@ -372,12 +448,45 @@ class RiskManager:
             if notional == 0:
                 continue
 
-            loss_pct = abs(pnl / notional) * 100 if pnl < 0 else 0
+            # P2.4: extract leverage with safe fallback
+            leverage = None
+            lev_raw = pos.get("leverage")
+            if isinstance(lev_raw, dict):
+                lev_val = lev_raw.get("value")
+                if lev_val is not None:
+                    try:
+                        leverage = float(lev_val)
+                    except (TypeError, ValueError):
+                        leverage = None
+            elif lev_raw is not None:
+                try:
+                    leverage = float(lev_raw)
+                except (TypeError, ValueError):
+                    leverage = None
+
+            fallback_used = False
+            if leverage is None or leverage <= 0:
+                leverage = max(1.0, self.max_leverage)
+                fallback_used = True
+                logging.info(
+                    "RISK P2.4: leverage field missing/malformed for %s — "
+                    "fallback to MAX_LEVERAGE=%.1f",
+                    coin, leverage,
+                )
+
+            margin = notional / leverage
+            if margin == 0:
+                continue
+
+            loss_pct = abs(pnl / margin) * 100 if pnl < 0 else 0
 
             if loss_pct >= self.max_loss_per_position_pct:
                 logging.warning(
-                    "RISK: Force-closing %s — loss %.2f%% exceeds max %.2f%%",
-                    coin, loss_pct, self.max_loss_per_position_pct
+                    "RISK: Force-closing %s — margin loss %.2f%% exceeds max %.2f%% "
+                    "(pnl=$%.2f, margin=$%.2f, leverage=%.1fx%s)",
+                    coin, loss_pct, self.max_loss_per_position_pct,
+                    pnl, margin, leverage,
+                    " [fallback]" if fallback_used else "",
                 )
                 to_close.append({
                     "coin": coin,
@@ -385,6 +494,9 @@ class RiskManager:
                     "is_long": size > 0,
                     "loss_pct": round(loss_pct, 2),
                     "pnl": round(pnl, 2),
+                    "margin": round(margin, 2),
+                    "leverage": leverage,
+                    "leverage_fallback": fallback_used,
                 })
         return to_close
 
@@ -426,28 +538,38 @@ class RiskManager:
         if not ok:
             return False, reason, trade
 
+        # P2.7 — low-conviction volume gate (block entries on dead tape)
+        ok, reason = self.check_volume_conviction(trade)
+        if not ok:
+            return False, reason, trade
+
         alloc_usd = float(trade.get("allocation_usd", 0))
         if alloc_usd <= 0:
             return False, "Zero or negative allocation", trade
 
-        # S4: ATR-scaled sizing — shrink in high vol, allow more in low vol.
-        # atr_ratio = short-term ATR / long-term ATR (e.g. atr3_4h / atr14_4h).
+        # P2.1: ATR-scaled sizing — shrink in high vol, normal in low vol.
+        # No "boost in low vol" (HIGH_SIZE_MULT defaults to 1.0): the point of
+        # vol-scaling is to reduce risk in chop, not add risk in calm markets.
+        # atr_ratio = short-term ATR / long-term ATR (atr3_4h / atr14_4h)
         try:
             atr_ratio = float(trade.get("atr_ratio") or 0)
         except (TypeError, ValueError):
             atr_ratio = 0
         if atr_ratio > 0:
-            if atr_ratio > 1.5:
-                scale = 0.7
-            elif atr_ratio < 0.7:
-                scale = 1.2
+            if atr_ratio > self.atr_ratio_high:
+                scale = self.atr_low_size_mult
+                regime = "HIGH_VOL"
+            elif atr_ratio < self.atr_ratio_low:
+                scale = self.atr_high_size_mult
+                regime = "LOW_VOL"
             else:
                 scale = 1.0
+                regime = "NORMAL_VOL"
             if scale != 1.0:
                 new_alloc = alloc_usd * scale
                 logging.info(
-                    "RISK S4: atr_ratio=%.2f → scaling alloc $%.2f × %.2f = $%.2f",
-                    atr_ratio, alloc_usd, scale, new_alloc
+                    "RISK P2.1: atr_ratio=%.2f (%s) → scaling alloc $%.2f × %.2f = $%.2f",
+                    atr_ratio, regime, alloc_usd, scale, new_alloc,
                 )
                 alloc_usd = new_alloc
                 trade = {**trade, "allocation_usd": alloc_usd}
@@ -511,13 +633,64 @@ class RiskManager:
         current_price = float(trade.get("current_price", 0))
         entry_price = current_price if current_price > 0 else 1.0
         sl_price = trade.get("sl_price")
-        enforced_sl = self.enforce_stop_loss(sl_price, entry_price, is_buy)
+        enforced_sl = self.enforce_stop_loss(sl_price, entry_price, is_buy, asset=coin)
         if sl_price is None:
             logging.info("RISK: Auto-setting SL at %.2f (%.1f%% from entry)",
                         enforced_sl, self.mandatory_sl_pct)
         trade = {**trade, "sl_price": enforced_sl}
 
+        # 8. P2.6 — minimum reward:risk ratio
+        ok, reason = self.check_min_rr(trade, entry_price, is_buy)
+        if not ok:
+            return False, reason, trade
+
         return True, "", trade
+
+    def check_min_rr(self, trade: dict, entry_price: float,
+                      is_buy: bool) -> tuple[bool, str]:
+        """Reject entries whose reward:risk ratio is below MIN_RR (P2.6).
+
+        Long  R:R = (tp - entry) / (entry - sl)
+        Short R:R = (entry - tp) / (sl - entry)
+
+        Trades without a TP defined are not gated by this check — TP is
+        recommended but not mandatory (SL is). Allowing TP=None preserves
+        the existing behaviour where the LLM can leave a position open-ended.
+        """
+        try:
+            tp_raw = trade.get("tp_price")
+            sl_raw = trade.get("sl_price")
+        except Exception:
+            return True, ""
+        if tp_raw is None:
+            return True, ""  # no TP defined — nothing to gate against
+        try:
+            tp = float(tp_raw)
+            sl = float(sl_raw)
+            entry = float(entry_price)
+        except (TypeError, ValueError):
+            return True, ""  # malformed values — skip rather than block
+
+        if is_buy:
+            risk = entry - sl
+            reward = tp - entry
+        else:
+            risk = sl - entry
+            reward = entry - tp
+
+        if risk <= 0:
+            # SL on wrong side of entry — separate problem, not an R:R issue
+            return False, f"sl_wrong_side: entry={entry:.6f} sl={sl:.6f} ({'long' if is_buy else 'short'})"
+        if reward <= 0:
+            return False, f"tp_wrong_side: entry={entry:.6f} tp={tp:.6f} ({'long' if is_buy else 'short'})"
+
+        rr = reward / risk
+        if rr < self.min_rr:
+            return False, (
+                f"min_rr_not_met: {rr:.2f} < {self.min_rr} "
+                f"(entry={entry:.6f} tp={tp:.6f} sl={sl:.6f})"
+            )
+        return True, ""
 
     def get_risk_summary(self) -> dict:
         """Return current risk parameters for inclusion in LLM context."""
