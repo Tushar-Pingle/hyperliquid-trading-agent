@@ -115,6 +115,23 @@ CONFIG = {
     # P1.1 — stacking guard escape hatch (leave false unless you deliberately want scale-in)
     "stacking_allow_scale_in": _get_bool("STACKING_ALLOW_SCALE_IN", False),
 
+    # P2.1 — ATR-scaled position sizing
+    # atr_ratio = short-term ATR / long-term ATR (atr3 / atr14 on 4h)
+    "atr_ratio_high": _get_env("ATR_RATIO_HIGH", "1.5"),     # above this: high vol regime
+    "atr_ratio_low": _get_env("ATR_RATIO_LOW", "0.7"),       # below this: low vol regime
+    "atr_low_size_mult": _get_env("LOW_SIZE_MULT", "0.5"),   # high vol → shrink allocation
+    "atr_high_size_mult": _get_env("HIGH_SIZE_MULT", "1.0"), # low vol → normal (no boost above cap)
+
+    # P2.5 — trade log + Sharpe
+    "min_sharpe_sample": _get_env("MIN_SHARPE_SAMPLE", "10"),
+    "sharpe_window": _get_env("SHARPE_WINDOW", "50"),
+
+    # P2.6 — minimum reward:risk on entries
+    "min_rr": _get_env("MIN_RR", "1.5"),
+
+    # P2.7 — low-conviction volume gate
+    "min_vol_spike_ratio": _get_env("MIN_VOL_SPIKE_RATIO", "0.5"),
+
     # Legacy / optional
     "taapi_api_key": _get_env("TAAPI_API_KEY"),
     "openrouter_api_key": _get_env("OPENROUTER_API_KEY"),

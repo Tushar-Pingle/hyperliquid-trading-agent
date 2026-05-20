@@ -61,6 +61,18 @@ class RiskManager:
         # P1.1 — stacking guard
         self.allow_scale_in = bool(CONFIG.get("stacking_allow_scale_in", False))
 
+        # P2.1 — ATR-scaled sizing thresholds (env-driven, no hardcoded magic numbers)
+        self.atr_ratio_high = float(CONFIG.get("atr_ratio_high") or 1.5)
+        self.atr_ratio_low = float(CONFIG.get("atr_ratio_low") or 0.7)
+        self.atr_low_size_mult = float(CONFIG.get("atr_low_size_mult") or 0.5)
+        self.atr_high_size_mult = float(CONFIG.get("atr_high_size_mult") or 1.0)
+
+        # P2.6 — minimum reward:risk on entries
+        self.min_rr = float(CONFIG.get("min_rr") or 1.5)
+
+        # P2.7 — low-conviction volume gate
+        self.min_vol_spike_ratio = float(CONFIG.get("min_vol_spike_ratio") or 0.5)
+
         # P1.2 — per-asset cooldown
         self.cooldown_bars = int(CONFIG.get("cooldown_bars") or 3)
         self.interval_sec = 300.0  # default 5 m; set by set_interval() after arg parsing
@@ -498,24 +510,29 @@ class RiskManager:
         if alloc_usd <= 0:
             return False, "Zero or negative allocation", trade
 
-        # S4: ATR-scaled sizing — shrink in high vol, allow more in low vol.
-        # atr_ratio = short-term ATR / long-term ATR (e.g. atr3_4h / atr14_4h).
+        # P2.1: ATR-scaled sizing — shrink in high vol, normal in low vol.
+        # No "boost in low vol" (HIGH_SIZE_MULT defaults to 1.0): the point of
+        # vol-scaling is to reduce risk in chop, not add risk in calm markets.
+        # atr_ratio = short-term ATR / long-term ATR (atr3_4h / atr14_4h)
         try:
             atr_ratio = float(trade.get("atr_ratio") or 0)
         except (TypeError, ValueError):
             atr_ratio = 0
         if atr_ratio > 0:
-            if atr_ratio > 1.5:
-                scale = 0.7
-            elif atr_ratio < 0.7:
-                scale = 1.2
+            if atr_ratio > self.atr_ratio_high:
+                scale = self.atr_low_size_mult
+                regime = "HIGH_VOL"
+            elif atr_ratio < self.atr_ratio_low:
+                scale = self.atr_high_size_mult
+                regime = "LOW_VOL"
             else:
                 scale = 1.0
+                regime = "NORMAL_VOL"
             if scale != 1.0:
                 new_alloc = alloc_usd * scale
                 logging.info(
-                    "RISK S4: atr_ratio=%.2f → scaling alloc $%.2f × %.2f = $%.2f",
-                    atr_ratio, alloc_usd, scale, new_alloc
+                    "RISK P2.1: atr_ratio=%.2f (%s) → scaling alloc $%.2f × %.2f = $%.2f",
+                    atr_ratio, regime, alloc_usd, scale, new_alloc,
                 )
                 alloc_usd = new_alloc
                 trade = {**trade, "allocation_usd": alloc_usd}
