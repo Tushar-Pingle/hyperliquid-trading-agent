@@ -89,6 +89,8 @@ def main():
     interval_sec = get_interval_seconds(args.interval)
     risk_mgr.set_interval(interval_sec)
     risk_mgr.load_cooldowns()
+    # P2.3 — asset-aware SL price rounding (DOGE-tier prices break with round(x,2))
+    risk_mgr.set_price_rounder(hyperliquid.round_price)
 
     # P1.3 — warn when loop interval is shorter than recommended (cuts fee drag)
     if interval_sec < 900:  # 15 m

@@ -146,6 +146,23 @@ class HyperliquidAPI:
                 break
         raise last_err if last_err else RuntimeError("Hyperliquid retry: unknown error")
 
+    def _lookup_sz_decimals(self, asset):
+        """Return szDecimals for *asset* or None if unknown."""
+        meta = self._meta_cache[0] if hasattr(self, '_meta_cache') and self._meta_cache else None
+        if meta:
+            asset_info = next((u for u in meta.get("universe", []) if u.get("name") == asset), None)
+            if asset_info is not None:
+                return asset_info.get("szDecimals")
+        if ":" in asset:
+            dex = asset.split(":")[0]
+            dex_data = self._hip3_meta_cache.get(dex) if hasattr(self, '_hip3_meta_cache') else None
+            if dex_data and isinstance(dex_data, list) and len(dex_data) >= 1:
+                dex_meta = dex_data[0]
+                asset_info = next((u for u in dex_meta.get("universe", []) if u.get("name") == asset), None)
+                if asset_info is not None:
+                    return asset_info.get("szDecimals")
+        return None
+
     def round_size(self, asset, amount):
         """Round order size to the asset precision defined by market metadata.
 
@@ -156,26 +173,36 @@ class HyperliquidAPI:
         Returns:
             The input ``amount`` rounded to the market's ``szDecimals`` precision.
         """
-        # Check main dex cache first
-        meta = self._meta_cache[0] if hasattr(self, '_meta_cache') and self._meta_cache else None
-        if meta:
-            universe = meta.get("universe", [])
-            asset_info = next((u for u in universe if u.get("name") == asset), None)
-            if asset_info:
-                decimals = asset_info.get("szDecimals", 8)
-                return round(amount, decimals)
-        # Check HIP-3 dex cache
-        if ":" in asset:
-            dex = asset.split(":")[0]
-            dex_data = self._hip3_meta_cache.get(dex) if hasattr(self, '_hip3_meta_cache') else None
-            if dex_data and isinstance(dex_data, list) and len(dex_data) >= 1:
-                dex_meta = dex_data[0]  # [meta_dict, asset_ctxs_list]
-                universe = dex_meta.get("universe", [])
-                asset_info = next((u for u in universe if u.get("name") == asset), None)
-                if asset_info:
-                    decimals = asset_info.get("szDecimals", 8)
-                    return round(amount, decimals)
-        return round(amount, 8)
+        sz = self._lookup_sz_decimals(asset)
+        if sz is None:
+            return round(amount, 8)
+        return round(amount, int(sz))
+
+    def price_decimals(self, asset):
+        """Return the per-asset price precision in decimal places.
+
+        Hyperliquid perp convention: ``pxDecimals = max(0, 6 - szDecimals)``.
+        Returns ``None`` when the asset is unknown so callers can decide on a fallback.
+        """
+        sz = self._lookup_sz_decimals(asset)
+        if sz is None:
+            return None
+        return max(0, 6 - int(sz))
+
+    def round_price(self, asset, price):
+        """Round *price* to the asset's tick precision.
+
+        Falls back to 2 decimals when metadata is unavailable so callers can
+        log + continue rather than crash on a new HIP-3 listing.
+        """
+        try:
+            p = float(price)
+        except (TypeError, ValueError):
+            return price
+        decimals = self.price_decimals(asset)
+        if decimals is None:
+            return round(p, 2)
+        return round(p, decimals)
 
     async def place_buy_order(self, asset, amount, slippage=0.01):
         """Submit a market buy order with exchange-side rounding and retry logic.

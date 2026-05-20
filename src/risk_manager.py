@@ -66,6 +66,10 @@ class RiskManager:
         self.interval_sec = 300.0  # default 5 m; set by set_interval() after arg parsing
         self._cooldowns: dict = {}  # {canonical_coin: {last_action_ts, last_action}}
 
+        # P2.3 — asset-aware price precision. Set by main() via set_price_rounder().
+        # Signature: (asset: str, price: float) -> float
+        self._price_rounder = None
+
         # Daily tracking
         self.daily_high_value = None
         self.daily_high_date = None
@@ -78,6 +82,14 @@ class RiskManager:
 
     def set_interval(self, interval_sec: float) -> None:
         self.interval_sec = float(interval_sec)
+
+    def set_price_rounder(self, rounder) -> None:
+        """Install an asset-aware price-rounding callable (P2.3).
+
+        ``rounder(asset, price) -> float``. When unset, ``enforce_stop_loss``
+        falls back to 2-decimal rounding for backward compatibility.
+        """
+        self._price_rounder = rounder
 
     # ------------------------------------------------------------------
     # Cooldown persistence — P1.2
@@ -332,16 +344,24 @@ class RiskManager:
     # ------------------------------------------------------------------
 
     def enforce_stop_loss(self, sl_price: float | None, entry_price: float,
-                           is_buy: bool) -> float:
-        """Ensure every trade has a stop-loss. Auto-set if missing."""
+                           is_buy: bool, asset: str = "") -> float:
+        """Ensure every trade has a stop-loss. Auto-set if missing.
+
+        Uses the asset-aware price rounder (P2.3) when available so a
+        low-priced asset (e.g. DOGE at 0.08) doesn't get its SL rounded to 0.08
+        away from a 0.0795 entry. Falls back to 2 decimals when the rounder
+        isn't installed (standalone tests / boot before main wiring).
+        """
         if sl_price is not None:
             return sl_price
-        # Auto-set SL at mandatory_sl_pct from entry
         sl_distance = entry_price * (self.mandatory_sl_pct / 100.0)
-        if is_buy:
-            return round(entry_price - sl_distance, 2)
-        else:
-            return round(entry_price + sl_distance, 2)
+        raw = entry_price - sl_distance if is_buy else entry_price + sl_distance
+        if self._price_rounder is not None and asset:
+            try:
+                return float(self._price_rounder(asset, raw))
+            except Exception as e:
+                logging.warning("RISK P2.3: price rounder failed for %s (%s); using 2-decimal fallback", asset, e)
+        return round(raw, 2)
 
     # ------------------------------------------------------------------
     # Force-close losing positions
@@ -511,7 +531,7 @@ class RiskManager:
         current_price = float(trade.get("current_price", 0))
         entry_price = current_price if current_price > 0 else 1.0
         sl_price = trade.get("sl_price")
-        enforced_sl = self.enforce_stop_loss(sl_price, entry_price, is_buy)
+        enforced_sl = self.enforce_stop_loss(sl_price, entry_price, is_buy, asset=coin)
         if sl_price is None:
             logging.info("RISK: Auto-setting SL at %.2f (%.1f%% from entry)",
                         enforced_sl, self.mandatory_sl_pct)
