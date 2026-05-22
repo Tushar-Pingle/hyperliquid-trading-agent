@@ -29,3 +29,8 @@ llm_requests.log
 trading_history.log
 *.log
 diary.jsonl
+trade_log.jsonl
+active_trades.json
+cooldowns.json
+decisions.jsonl
+regime_brief.json
