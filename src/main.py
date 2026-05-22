@@ -665,6 +665,107 @@ def main():
             # to "fail closed") — the LLM was given the schema and chose
             # not to use it. We log exit_rules_missing on entry, not here.
             market_by_asset = {s["asset"]: s for s in market_sections if isinstance(s, dict)}
+
+            # --- P3.1: Trailing stop management ---
+            # Runs every cycle after market data is fresh.
+            # Never loosens a stop — only moves it tighter when peak advances.
+            if CONFIG.get("trailing_stop_enabled", True):
+                _trail_activate_r = float(CONFIG.get("trail_activate_r") or 1.0)
+                _trail_distance_atr = float(CONFIG.get("trail_distance_atr") or 1.0)
+                for tr in active_trades:
+                    try:
+                        _t_asset = tr.get('asset')
+                        _t_long = tr.get('is_long')
+                        if _t_long is None or not _t_asset:
+                            continue
+                        _t_msec = market_by_asset.get(_t_asset)
+                        if not _t_msec:
+                            continue
+                        _t_cur = float(_t_msec.get('current_price') or 0)
+                        _t_atr = float((_t_msec.get('long_term') or {}).get('atr14') or 0)
+                        if _t_cur <= 0 or _t_atr <= 0:
+                            continue
+                        _t_entry = float(tr.get('entry_price') or 0)
+                        if _t_entry <= 0:
+                            continue
+                        # Initialise tracking fields on first cycle (backward compat)
+                        if 'current_sl_price' not in tr:
+                            tr['current_sl_price'] = tr.get('sl_price')
+                        _t_cur_sl = tr.get('current_sl_price')
+                        if _t_cur_sl is None:
+                            continue
+                        _t_cur_sl = float(_t_cur_sl)
+                        if 'peak_price' not in tr:
+                            tr['peak_price'] = _t_entry
+                        # Update peak — only tighter direction
+                        _t_peak = (
+                            max(float(tr['peak_price']), _t_cur) if _t_long
+                            else min(float(tr['peak_price']), _t_cur)
+                        )
+                        tr['peak_price'] = _t_peak
+                        # Check activation threshold
+                        _t_orig_risk = abs(_t_entry - _t_cur_sl)
+                        if _t_orig_risk <= 0:
+                            continue
+                        _t_profit = (_t_peak - _t_entry) if _t_long else (_t_entry - _t_peak)
+                        if _t_profit < _trail_activate_r * _t_orig_risk:
+                            continue
+                        # Compute candidate trailing SL
+                        _t_new_sl = (
+                            (_t_peak - _trail_distance_atr * _t_atr) if _t_long
+                            else (_t_peak + _trail_distance_atr * _t_atr)
+                        )
+                        # Only move tighter — never loosen
+                        _t_is_tighter = (_t_new_sl > _t_cur_sl) if _t_long else (_t_new_sl < _t_cur_sl)
+                        if not _t_is_tighter:
+                            continue
+                        # Cancel old SL and place tighter trailing SL
+                        _t_old_oid = tr.get('sl_oid')
+                        _t_sl_sz = float(tr.get('remaining_size') or tr.get('amount') or 0)
+                        if _t_sl_sz <= 0:
+                            continue
+                        try:
+                            if _t_old_oid:
+                                await hyperliquid.cancel_order(_t_asset, _t_old_oid)
+                        except Exception as _t_ce:
+                            add_event(f"P3.1: cancel old SL failed {_t_asset}: {_t_ce}")
+                        try:
+                            _t_sl_res = await hyperliquid.place_stop_loss(
+                                _t_asset, _t_long, _t_sl_sz, _t_new_sl
+                            )
+                            _t_new_oids = hyperliquid.extract_oids(_t_sl_res)
+                            _t_new_oid = _t_new_oids[0] if _t_new_oids else None
+                            if _t_new_oid:
+                                _t_was_trailing = tr.get('trailing_active', False)
+                                tr['sl_oid'] = _t_new_oid
+                                tr['current_sl_price'] = _t_new_sl
+                                tr['trailing_active'] = True
+                                save_active_trades()
+                                _t_lbl = "trailing_activated" if not _t_was_trailing else "trailing_updated"
+                                add_event(
+                                    f"P3.1 {_t_lbl}: {_t_asset} SL → {_t_new_sl:.4f} "
+                                    f"(peak={_t_peak:.4f} ATR={_t_atr:.4f} "
+                                    f"R_mult={_t_profit / _t_orig_risk:.2f})"
+                                )
+                                with open(diary_path, "a") as f:
+                                    f.write(json.dumps({
+                                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                                        "asset": _t_asset,
+                                        "action": _t_lbl,
+                                        "new_sl": round_or_none(_t_new_sl, 6),
+                                        "peak_price": round_or_none(_t_peak, 6),
+                                        "atr14_4h": round_or_none(_t_atr, 6),
+                                        "profit_r": round_or_none(_t_profit / _t_orig_risk, 3),
+                                    }) + "\n")
+                            else:
+                                add_event(
+                                    f"P3.1 WARNING: trailing SL for {_t_asset} returned no oid — keeping old"
+                                )
+                        except Exception as _t_pe:
+                            add_event(f"P3.1: place trailing SL failed {_t_asset}: {_t_pe} — keeping old")
+                    except Exception:
+                        continue
+
             for tr in active_trades[:]:
                 try:
                     rules = tr.get("exit_rules") or []

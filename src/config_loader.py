@@ -135,6 +135,11 @@ CONFIG = {
     # P2.5.4 — concise mode: shorter LLM output on hold-all cycles
     "concise_mode": _get_bool("CONCISE_MODE", True),
 
+    # P3.1 — trailing stop loss
+    "trailing_stop_enabled": _get_bool("TRAILING_STOP_ENABLED", True),
+    "trail_activate_r": _get_env("TRAIL_ACTIVATE_R", "1.0"),
+    "trail_distance_atr": _get_env("TRAIL_DISTANCE_ATR", "1.0"),
+
     # Legacy / optional
     "taapi_api_key": _get_env("TAAPI_API_KEY"),
     "openrouter_api_key": _get_env("OPENROUTER_API_KEY"),
