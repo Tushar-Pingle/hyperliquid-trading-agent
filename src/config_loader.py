@@ -150,6 +150,10 @@ CONFIG = {
     # P3.2 — SL too-tight gate (prevents clustering TP1/TP2 on top of entry)
     "min_r_as_atr_fraction": _get_env("MIN_R_AS_ATR_FRACTION", "0.3"),
 
+    # P3.3 — per-asset performance memory in prompt
+    "perf_memory_enabled": _get_bool("PERF_MEMORY_ENABLED", True),
+    "perf_memory_window": _get_env("PERF_MEMORY_WINDOW", "20"),
+
     # Legacy / optional
     "taapi_api_key": _get_env("TAAPI_API_KEY"),
     "openrouter_api_key": _get_env("OPENROUTER_API_KEY"),

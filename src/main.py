@@ -650,6 +650,15 @@ def main():
                         "funding_annualized_pct": funding_annualized,
                         "hip3_market_frozen": (':' in asset and is_hip3_frozen()),
                         "recent_mid_prices": recent_mids,
+                        # P3.3: per-asset performance memory (None = <2 records, insufficient data)
+                        "recent_performance": (
+                            compute_asset_perf(
+                                trade_log, asset,
+                                int(CONFIG.get("perf_memory_window") or 20)
+                            )
+                            if CONFIG.get("perf_memory_enabled", True)
+                            else None
+                        ),
                     })
                 except Exception as e:
                     add_event(f"Data gather error {asset}: {e}")
@@ -1644,6 +1653,39 @@ def main():
         initial = 10000
         current = state['balance'] + sum(p.get('pnl', 0) for p in state.get('positions', []))
         return ((current - initial) / initial) * 100 if initial else 0
+
+    def compute_asset_perf(records, asset, window):
+        """Return per-asset win/loss stats from the last `window` closed trades (P3.3).
+
+        Returns None when fewer than 2 records exist for the asset (not enough
+        to compute a meaningful win rate — avoids spurious 0% or 100% displays).
+        """
+        asset_recs = [
+            r for r in records
+            if r.get("asset") == asset and r.get("pnl") is not None
+        ]
+        asset_recs = asset_recs[-window:]
+        if len(asset_recs) < 2:
+            return None
+        wins = [r for r in asset_recs if float(r["pnl"]) > 0]
+        losses = [r for r in asset_recs if float(r["pnl"]) <= 0]
+        win_rate = len(wins) / len(asset_recs)
+        avg_win = sum(float(r["pnl"]) for r in wins) / len(wins) if wins else 0.0
+        avg_loss = sum(float(r["pnl"]) for r in losses) / len(losses) if losses else 0.0
+        net_pnl = sum(float(r["pnl"]) for r in asset_recs)
+        outcomes = []
+        for r in asset_recs[-5:]:
+            outcomes.append("W" if float(r["pnl"]) > 0 else "L")
+        return {
+            "trades": len(asset_recs),
+            "wins": len(wins),
+            "losses": len(losses),
+            "win_rate": round(win_rate, 3),
+            "avg_win": round(avg_win, 4),
+            "avg_loss": round(avg_loss, 4),
+            "net_pnl": round(net_pnl, 4),
+            "last_5_outcomes": outcomes,
+        }
 
     def calculate_sharpe(records):
         """Compute Sharpe from closed-trade records using pnl/margin returns (P2.5).
