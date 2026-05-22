@@ -22,11 +22,11 @@ class TradingAgent:
         self.sanitize_model = CONFIG.get("sanitize_model") or "claude-haiku-4-5-20251001"
         self.max_tokens = int(CONFIG.get("max_tokens") or 4096)
 
-    def decide_trade(self, assets, context):
+    def decide_trade(self, assets, context, has_active_trades=False):
         """Decide for multiple assets in one call."""
-        return self._decide(context, assets=assets)
+        return self._decide(context, assets=assets, has_active_trades=has_active_trades)
 
-    def _decide(self, context, assets):
+    def _decide(self, context, assets, has_active_trades=False):
         """Dispatch decision request to Claude and enforce output contract."""
         system_prompt = (
             "You are a rigorous QUANTITATIVE TRADER and interdisciplinary MATHEMATICIAN-ENGINEER optimizing risk-adjusted returns for perpetual futures under real execution, margin, and funding constraints.\n"
@@ -41,11 +41,30 @@ class TradingAgent:
             "Volume context (per asset): each market_data entry now includes vol_spike_ratio = current bar volume / 20-bar SMA volume on both 5m and 4h. Avoid initiating new entries when 5m vol_spike_ratio < 0.7 — low-conviction tape produces whipsaws. A 5m spike > 2.0 with aligned direction is a real-time momentum confirmation.\n\n"
             "Volatility-scaled sizing: market_data.long_term.atr_ratio_short_over_long = atr3/atr14 on 4h. >1.5 means short-term vol is much higher than baseline (regime expansion → risk manager will shrink allocation by 30%); <0.7 means dead-tape contraction (risk manager will allow 20% more). Plan TP/SL distances accordingly.\n\n"
             "HIP-3 weekend freeze: assets prefixed with a colon (e.g. xyz:CL, xyz:GOLD) are HIP-3 perp dexes whose oracle freezes Fri 16:50 → Sun 22:00 UTC. market_data.<asset>.hip3_market_frozen flags this. During the freeze the system hard-blocks new HIP-3 entries and auto-closes existing HIP-3 positions; do NOT plan entries that depend on price action inside the freeze window.\n\n"
-            "TP/SL placement (P2.6): Do not pick arbitrary 1-2% targets — those get wicked through on 5m bars. Anchor BOTH TP and SL to structure plus ATR:\n"
-            "  • TP: next swing high/low OR ema50 ± ~1×ATR(14, 4h) in the direction of the trade, whichever is more conservative.\n"
-            "  • SL: most recent opposite swing point ± ~0.5×ATR(14, 4h) (i.e. invalidation of the structural setup).\n"
-            "  HARD GATE: the risk manager rejects any entry whose reward:risk ratio is below MIN_RR (default 1.5). For longs that's (tp-entry)/(entry-sl) >= 1.5; for shorts (entry-tp)/(sl-entry) >= 1.5. Plan TP/SL such that R:R clears this bar, or skip the trade — a too-tight TP will get the entry rejected and you'll miss the move entirely.\n"
-            "  This keeps R:R coherent across regimes; in calm tape that means tighter TPs, in expansion regimes that means wider stops.\n\n"
+            "TP/SL placement — follow this exact sequence every time you consider an entry:\n"
+            "  STEP 1 — SET YOUR STOP-LOSS FIRST.\n"
+            "    Place SL at the structural invalidation level: recent swing low for longs, recent swing high for shorts, offset by ~0.5×ATR(14,4h).\n"
+            "    This defines your unit of risk: R = |entry_price − sl_price|.\n"
+            "  STEP 2 — COMPUTE TP_MINIMUM FROM R.\n"
+            "    For longs:  TP_minimum = entry_price + 1.5 × R\n"
+            "    For shorts: TP_minimum = entry_price − 1.5 × R\n"
+            "  STEP 3 — CHOOSE YOUR ACTUAL TP AT OR BEYOND TP_MINIMUM.\n"
+            "    • If a structural target (swing high/low, EMA50, range edge) lies AT or BEYOND TP_minimum → use it.\n"
+            "    • If every nearby structural target is CLOSER than TP_minimum → either use TP_minimum itself or skip the trade.\n"
+            "    • NEVER place TP closer than TP_minimum just because the chart shows a nearby resistance.\n"
+            "  STEP 4 — IF NO VIABLE TP EXISTS AT ≥ 1.5R, DO NOT ENTER. HOLD INSTEAD.\n"
+            "    A trade with no realistic 1.5R+ target has no positive expectancy.\n"
+            "  WORKED EXAMPLE (long):\n"
+            "    Entry = 100.00, recent swing low = 97.50 → SL = 97.50 − 0.5×ATR ≈ 97.00 → R = 3.00\n"
+            "    TP_minimum = 100.00 + 1.5×3.00 = 104.50\n"
+            "    Nearest resistance at 103.00 < 104.50 → skip OR use 104.50 as TP if structure allows.\n"
+            "    Next resistance at 106.00 ≥ 104.50 → use 106.00. R:R = 6.00/3.00 = 2.0 ✓\n"
+            "  WORKED EXAMPLE (short):\n"
+            "    Entry = 50.00, recent swing high = 52.00 → SL = 52.00 + 0.5×ATR ≈ 52.50 → R = 2.50\n"
+            "    TP_minimum = 50.00 − 1.5×2.50 = 46.25\n"
+            "    Support at 48.00 > 46.25 → too close, skip OR use 46.25 as TP.\n"
+            "    Next support at 45.00 ≤ 46.25 → use 45.00. R:R = 5.00/2.50 = 2.0 ✓\n"
+            "  HARD GATE: the risk manager REJECTS any entry with R:R < MIN_RR (default 1.5). Do the math above before proposing TP/SL — a rejected entry wastes the cycle entirely.\n\n"
             "Funding-carry mode (S5): When |funding_annualized_pct| > 30% AND signals are neutral (5m RSI14 in 40-60 AND |4h macd| small relative to atr14), you may open a SMALL contra-funding position purely to harvest the carry. Size at most 0.4× a normal directional allocation, set SL at ~0.75×ATR(14, 4h) from entry, set TP wide (or null) since the edge is funding not price. Rationale should clearly say 'carry trade'. Skip this mode if HIP-3 is frozen for that asset or if 4h ATR is expanding (atr_ratio_short_over_long > 1.3) — funding edge isn't worth getting steamrolled by a directional move.\n\n"
             "Thesis-decay (S8): each active trade now carries an entry_thesis (the rationale you wrote when you opened it). On every cycle, RE-EVALUATE whether the original entry_thesis is still true. If the structural premise has broken (e.g., thesis said '4h MACD bearish' and 4h MACD is now positive) — close the position at market BEFORE TP/SL even if no hard invalidation has fired yet. Don't wait for the stop to take you out when your reason for being in the trade is gone.\n\n"
             "Your goal: make decisive, first-principles decisions per asset that minimize churn while capturing edge.\n\n"
@@ -101,6 +120,14 @@ class TradingAgent:
             "    Use exit_rules for HARD invalidation only — not soft thesis-decay. Soft decay belongs in exit_plan/rationale.\n"
             "- Do not emit Markdown or any extra properties.\n"
         )
+
+        concise_mode = CONFIG.get("concise_mode", True)
+        if concise_mode and not has_active_trades:
+            system_prompt += (
+                "\nCONCISE MODE: No positions are currently open. "
+                "If your decision for every asset is hold, keep your reasoning to one sentence per asset (25 words max each) — do not write multi-paragraph analysis for a hold-all cycle. "
+                "Full reasoning is required only when you are entering, exiting, or flipping a trade.\n"
+            )
 
         tools = [{
             "name": "fetch_indicator",
