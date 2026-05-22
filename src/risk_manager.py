@@ -537,11 +537,6 @@ class RiskManager:
         positions = account_state.get("positions", [])
         now = datetime.now(timezone.utc)
 
-        # P4.2 — volatile-regime gate (hard block before all other checks)
-        if self.regime_gate_volatile and regime_context:
-            if regime_context.get("regime") == "volatile" and not regime_context.get("stale"):
-                return False, "regime_blocked_volatile", trade
-
         # P1.2 — cooldown check (before any other guard; exits bypass this)
         ok, reason = self.check_cooldown(coin, now)
         if not ok:
@@ -551,6 +546,11 @@ class RiskManager:
         ok, reason = self.check_stacking(coin, is_buy, positions)
         if not ok:
             return False, reason, trade
+
+        # P4.2 — volatile-regime gate (after cheap memory checks, before data-dependent checks)
+        if self.regime_gate_volatile and regime_context:
+            if regime_context.get("regime") == "volatile" and not regime_context.get("stale"):
+                return False, "regime_blocked_volatile", trade
 
         # P2.7 — low-conviction volume gate (block entries on dead tape)
         ok, reason = self.check_volume_conviction(trade)

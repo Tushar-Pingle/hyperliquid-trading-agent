@@ -701,7 +701,8 @@ def main():
             market_by_asset = {s["asset"]: s for s in market_sections if isinstance(s, dict)}
 
             # --- P3.2: Partial TP1 fill detection + breakeven SL ---
-            # Check whether TP1 has filled (position size reduced to ~remaining half).
+            # Confirm TP1 filled by matching tp1_oid in recent fills (oid-based, not size-heuristic).
+            # Size check kept as belt-and-suspenders only — oid match is the authoritative signal.
             # When TP1 fires: cancel old full-size SL, place breakeven SL at entry price.
             # P3.1 trailing logic then takes over for the remainder when peak advances.
             if CONFIG.get("partial_tp_enabled", True) and CONFIG.get("move_sl_to_breakeven_at_tp1", True):
@@ -712,6 +713,12 @@ def main():
                         _p32_pos_by_coin[_pc] = _p
                         if ':' in _pc:
                             _p32_pos_by_coin[_pc.split(':', 1)[1]] = _p
+                # Fetch fills once for the whole loop (avoid N separate API calls)
+                _p32_recent_fills: list = []
+                try:
+                    _p32_recent_fills = await hyperliquid.get_recent_fills(limit=50) or []
+                except Exception as _p32_fe:
+                    add_event(f"P3.2: get_recent_fills failed (non-fatal): {_p32_fe}")
                 for tr in active_trades:
                     try:
                         if tr.get('tp1_filled') or not tr.get('tp1_oid'):
@@ -730,8 +737,19 @@ def main():
                         if _p32_live_pos is None:
                             continue
                         _p32_live_sz = abs(float(_p32_live_pos.get('szi') or 0))
+                        # Primary confirmation: tp1_oid appears in recent fills
+                        _p32_tp1_oid_str = str(tr['tp1_oid'])
+                        _p32_asset_bare = _p32_asset.split(':', 1)[1] if ':' in _p32_asset else _p32_asset
+                        _p32_tp1_confirmed = any(
+                            str(f.get('oid')) == _p32_tp1_oid_str
+                            and f.get('coin') in (_p32_asset, _p32_asset_bare)
+                            for f in _p32_recent_fills
+                        )
+                        if not _p32_tp1_confirmed:
+                            continue  # TP1 oid not found in fills — not triggered yet
+                        # Belt-and-suspenders: size should also have dropped
                         if _p32_live_sz > _p32_exp_rem * 1.1:
-                            continue  # TP1 hasn't filled yet
+                            continue  # TP1 fill seen but size hasn't settled — skip this cycle
                         # TP1 has filled — cancel old SL and place breakeven SL
                         _p32_entry = float(tr.get('entry_price') or 0)
                         _p32_old_sl = tr.get('sl_oid')
