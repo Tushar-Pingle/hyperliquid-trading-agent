@@ -673,6 +673,8 @@ def main():
                         "funding_annualized_pct": funding_annualized,
                         "hip3_market_frozen": (':' in asset and is_hip3_frozen()),
                         "recent_mid_prices": recent_mids,
+                        # P4.2: regime brief from slow-cadence analyzer (None = not yet computed)
+                        "regime": regime_brief_data.get(asset) or None,
                         # P3.3: per-asset performance memory (None = <2 records, insufficient data)
                         "recent_performance": (
                             compute_asset_perf(
@@ -1199,7 +1201,8 @@ def main():
                             except (TypeError, ValueError):
                                 pass
                         allowed, reason, output = risk_mgr.validate_trade(
-                            output, state, initial_account_value or 0
+                            output, state, initial_account_value or 0,
+                            regime_context=regime_brief_data.get(asset, {})
                         )
                         if not allowed:
                             add_event(f"RISK BLOCKED {asset}: {reason}")

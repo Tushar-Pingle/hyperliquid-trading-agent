@@ -157,6 +157,9 @@ CONFIG = {
     # P4.1 — regime analyzer cadence
     "regime_refresh_minutes": _get_env("REGIME_REFRESH_MINUTES", "60"),
 
+    # P4.2 — regime-conditional gate: hard-reject new entries in volatile regime
+    "regime_gate_volatile": _get_bool("REGIME_GATE_VOLATILE", True),
+
     # Legacy / optional
     "taapi_api_key": _get_env("TAAPI_API_KEY"),
     "openrouter_api_key": _get_env("OPENROUTER_API_KEY"),

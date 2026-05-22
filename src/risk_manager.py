@@ -76,6 +76,9 @@ class RiskManager:
         # P3.2 — SL too-tight gate: R must be ≥ this fraction of ATR14_4h
         self.min_r_as_atr_fraction = float(CONFIG.get("min_r_as_atr_fraction") or 0.3)
 
+        # P4.2 — hard-reject new entries in volatile regime
+        self.regime_gate_volatile = bool(CONFIG.get("regime_gate_volatile", True))
+
         # P1.2 — per-asset cooldown
         self.cooldown_bars = int(CONFIG.get("cooldown_bars") or 3)
         self.interval_sec = 300.0  # default 5 m; set by set_interval() after arg parsing
@@ -508,7 +511,8 @@ class RiskManager:
     # ------------------------------------------------------------------
 
     def validate_trade(self, trade: dict, account_state: dict,
-                        initial_balance: float) -> tuple[bool, str, dict]:
+                        initial_balance: float,
+                        regime_context: dict | None = None) -> tuple[bool, str, dict]:
         """Run all safety checks on a proposed trade.
 
         Args:
@@ -517,6 +521,8 @@ class RiskManager:
             account_state: Current account with keys:
                 balance, total_value, positions
             initial_balance: Starting balance for reserve check
+            regime_context: Optional regime brief for this asset (P4.2).
+                Keys: regime, vol_regime, stale, etc.
 
         Returns:
             (allowed, reason, adjusted_trade)
@@ -530,6 +536,11 @@ class RiskManager:
         is_buy = action == "buy"
         positions = account_state.get("positions", [])
         now = datetime.now(timezone.utc)
+
+        # P4.2 — volatile-regime gate (hard block before all other checks)
+        if self.regime_gate_volatile and regime_context:
+            if regime_context.get("regime") == "volatile" and not regime_context.get("stale"):
+                return False, "regime_blocked_volatile", trade
 
         # P1.2 — cooldown check (before any other guard; exits bypass this)
         ok, reason = self.check_cooldown(coin, now)
