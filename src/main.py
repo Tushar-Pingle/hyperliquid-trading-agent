@@ -217,7 +217,7 @@ def main():
 
     async def run_loop():
         """Main trading loop that gathers data, calls the agent, and executes trades."""
-        nonlocal invocation_count, initial_account_value
+        nonlocal invocation_count, initial_account_value, last_regime_refresh_ts, regime_brief_data
 
         # Pre-load meta cache for correct order sizing
         await hyperliquid.get_meta_and_ctxs()
