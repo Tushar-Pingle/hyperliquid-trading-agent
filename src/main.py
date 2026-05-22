@@ -21,6 +21,7 @@ import json
 from aiohttp import web
 from src.utils.formatting import format_number as fmt, format_size as fmt_sz
 from src.utils.prompt_utils import json_default, round_or_none, round_series
+from src.regime_analyzer import refresh_regime
 
 load_dotenv()
 
@@ -115,6 +116,9 @@ def main():
     initial_account_value = None
     # Perp mid-price history sampled each loop (authoritative, avoids spot/perp basis mismatch)
     price_history = {}
+    # P4.1: timestamp of last regime refresh; 0 = never (fires immediately on first cycle)
+    last_regime_refresh_ts = 0.0
+    regime_brief_data: dict = {}  # in-memory cache populated by refresh_regime()
 
     print(f"Starting trading agent for assets: {args.assets} at interval: {args.interval}")
 
@@ -280,6 +284,25 @@ def main():
         while True:
             invocation_count += 1
             minutes_since_start = (datetime.now(timezone.utc) - start_time).total_seconds() / 60
+
+            # --- P4.1: Regime refresh (slow cadence, non-blocking) ---
+            _regime_interval_sec = float(CONFIG.get("regime_refresh_minutes") or 60) * 60
+            if time.time() - last_regime_refresh_ts >= _regime_interval_sec:
+                try:
+                    regime_brief_data = await refresh_regime(
+                        hyperliquid, args.assets, "regime_brief.json"
+                    )
+                    last_regime_refresh_ts = time.time()
+                    add_event(
+                        f"P4.1 regime refreshed: "
+                        + ", ".join(
+                            f"{a}={regime_brief_data.get(a, {}).get('regime', '?')}"
+                            for a in args.assets
+                        )
+                    )
+                except Exception as _re:
+                    add_event(f"P4.1 regime refresh failed (non-fatal): {_re}")
+                    last_regime_refresh_ts = time.time()  # don't retry every cycle on failure
 
             # Global account state
             state = await hyperliquid.get_user_state()

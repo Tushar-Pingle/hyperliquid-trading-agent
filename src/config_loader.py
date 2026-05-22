@@ -154,6 +154,9 @@ CONFIG = {
     "perf_memory_enabled": _get_bool("PERF_MEMORY_ENABLED", True),
     "perf_memory_window": _get_env("PERF_MEMORY_WINDOW", "20"),
 
+    # P4.1 — regime analyzer cadence
+    "regime_refresh_minutes": _get_env("REGIME_REFRESH_MINUTES", "60"),
+
     # Legacy / optional
     "taapi_api_key": _get_env("TAAPI_API_KEY"),
     "openrouter_api_key": _get_env("OPENROUTER_API_KEY"),
