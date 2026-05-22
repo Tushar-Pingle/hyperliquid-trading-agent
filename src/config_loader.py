@@ -135,6 +135,31 @@ CONFIG = {
     # P2.5.4 — concise mode: shorter LLM output on hold-all cycles
     "concise_mode": _get_bool("CONCISE_MODE", True),
 
+    # P3.1 — trailing stop loss
+    "trailing_stop_enabled": _get_bool("TRAILING_STOP_ENABLED", True),
+    "trail_activate_r": _get_env("TRAIL_ACTIVATE_R", "1.0"),
+    "trail_distance_atr": _get_env("TRAIL_DISTANCE_ATR", "1.0"),
+
+    # P3.2 — partial take-profit + breakeven SL
+    "partial_tp_enabled": _get_bool("PARTIAL_TP_ENABLED", True),
+    "tp1_fraction": _get_env("TP1_FRACTION", "0.5"),
+    "tp1_at_r": _get_env("TP1_AT_R", "1.0"),
+    "tp2_at_r": _get_env("TP2_AT_R", "2.5"),
+    "move_sl_to_breakeven_at_tp1": _get_bool("MOVE_SL_TO_BREAKEVEN_AT_TP1", True),
+
+    # P3.2 — SL too-tight gate (prevents clustering TP1/TP2 on top of entry)
+    "min_r_as_atr_fraction": _get_env("MIN_R_AS_ATR_FRACTION", "0.3"),
+
+    # P3.3 — per-asset performance memory in prompt
+    "perf_memory_enabled": _get_bool("PERF_MEMORY_ENABLED", True),
+    "perf_memory_window": _get_env("PERF_MEMORY_WINDOW", "20"),
+
+    # P4.1 — regime analyzer cadence
+    "regime_refresh_minutes": _get_env("REGIME_REFRESH_MINUTES", "60"),
+
+    # P4.2 — regime-conditional gate: hard-reject new entries in volatile regime
+    "regime_gate_volatile": _get_bool("REGIME_GATE_VOLATILE", True),
+
     # Legacy / optional
     "taapi_api_key": _get_env("TAAPI_API_KEY"),
     "openrouter_api_key": _get_env("OPENROUTER_API_KEY"),

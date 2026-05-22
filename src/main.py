@@ -21,6 +21,7 @@ import json
 from aiohttp import web
 from src.utils.formatting import format_number as fmt, format_size as fmt_sz
 from src.utils.prompt_utils import json_default, round_or_none, round_series
+from src.regime_analyzer import refresh_regime
 
 load_dotenv()
 
@@ -115,6 +116,9 @@ def main():
     initial_account_value = None
     # Perp mid-price history sampled each loop (authoritative, avoids spot/perp basis mismatch)
     price_history = {}
+    # P4.1: timestamp of last regime refresh; 0 = never (fires immediately on first cycle)
+    last_regime_refresh_ts = 0.0
+    regime_brief_data: dict = {}  # in-memory cache populated by refresh_regime()
 
     print(f"Starting trading agent for assets: {args.assets} at interval: {args.interval}")
 
@@ -280,6 +284,25 @@ def main():
         while True:
             invocation_count += 1
             minutes_since_start = (datetime.now(timezone.utc) - start_time).total_seconds() / 60
+
+            # --- P4.1: Regime refresh (slow cadence, non-blocking) ---
+            _regime_interval_sec = float(CONFIG.get("regime_refresh_minutes") or 60) * 60
+            if time.time() - last_regime_refresh_ts >= _regime_interval_sec:
+                try:
+                    regime_brief_data = await refresh_regime(
+                        hyperliquid, args.assets, "regime_brief.json"
+                    )
+                    last_regime_refresh_ts = time.time()
+                    add_event(
+                        f"P4.1 regime refreshed: "
+                        + ", ".join(
+                            f"{a}={regime_brief_data.get(a, {}).get('regime', '?')}"
+                            for a in args.assets
+                        )
+                    )
+                except Exception as _re:
+                    add_event(f"P4.1 regime refresh failed (non-fatal): {_re}")
+                    last_regime_refresh_ts = time.time()  # don't retry every cycle on failure
 
             # Global account state
             state = await hyperliquid.get_user_state()
@@ -650,6 +673,17 @@ def main():
                         "funding_annualized_pct": funding_annualized,
                         "hip3_market_frozen": (':' in asset and is_hip3_frozen()),
                         "recent_mid_prices": recent_mids,
+                        # P4.2: regime brief from slow-cadence analyzer (None = not yet computed)
+                        "regime": regime_brief_data.get(asset) or None,
+                        # P3.3: per-asset performance memory (None = <2 records, insufficient data)
+                        "recent_performance": (
+                            compute_asset_perf(
+                                trade_log, asset,
+                                int(CONFIG.get("perf_memory_window") or 20)
+                            )
+                            if CONFIG.get("perf_memory_enabled", True)
+                            else None
+                        ),
                     })
                 except Exception as e:
                     add_event(f"Data gather error {asset}: {e}")
@@ -665,6 +699,198 @@ def main():
             # to "fail closed") — the LLM was given the schema and chose
             # not to use it. We log exit_rules_missing on entry, not here.
             market_by_asset = {s["asset"]: s for s in market_sections if isinstance(s, dict)}
+
+            # --- P3.2: Partial TP1 fill detection + breakeven SL ---
+            # Confirm TP1 filled by matching tp1_oid in recent fills (oid-based, not size-heuristic).
+            # Size check kept as belt-and-suspenders only — oid match is the authoritative signal.
+            # When TP1 fires: cancel old full-size SL, place breakeven SL at entry price.
+            # P3.1 trailing logic then takes over for the remainder when peak advances.
+            if CONFIG.get("partial_tp_enabled", True) and CONFIG.get("move_sl_to_breakeven_at_tp1", True):
+                _p32_pos_by_coin = {}
+                for _p in state.get('positions', []):
+                    _pc = _p.get('coin') or ''
+                    if _pc:
+                        _p32_pos_by_coin[_pc] = _p
+                        if ':' in _pc:
+                            _p32_pos_by_coin[_pc.split(':', 1)[1]] = _p
+                # Fetch fills once for the whole loop (avoid N separate API calls)
+                _p32_recent_fills: list = []
+                try:
+                    _p32_recent_fills = await hyperliquid.get_recent_fills(limit=50) or []
+                except Exception as _p32_fe:
+                    add_event(f"P3.2: get_recent_fills failed (non-fatal): {_p32_fe}")
+                for tr in active_trades:
+                    try:
+                        if tr.get('tp1_filled') or not tr.get('tp1_oid'):
+                            continue  # legacy trade (no tp1_oid) or already processed
+                        _p32_asset = tr.get('asset')
+                        _p32_long = tr.get('is_long')
+                        if not _p32_asset or _p32_long is None:
+                            continue
+                        _p32_orig = float(tr.get('original_size') or tr.get('amount') or 0)
+                        _p32_frac = float(CONFIG.get("tp1_fraction") or 0.5)
+                        _p32_exp_rem = _p32_orig * (1.0 - _p32_frac)
+                        _p32_live_pos = (
+                            _p32_pos_by_coin.get(_p32_asset)
+                            or _p32_pos_by_coin.get(_p32_asset.split(':', 1)[1] if ':' in _p32_asset else '')
+                        )
+                        if _p32_live_pos is None:
+                            continue
+                        _p32_live_sz = abs(float(_p32_live_pos.get('szi') or 0))
+                        # Primary confirmation: tp1_oid appears in recent fills
+                        _p32_tp1_oid_str = str(tr['tp1_oid'])
+                        _p32_asset_bare = _p32_asset.split(':', 1)[1] if ':' in _p32_asset else _p32_asset
+                        _p32_tp1_confirmed = any(
+                            str(f.get('oid')) == _p32_tp1_oid_str
+                            and f.get('coin') in (_p32_asset, _p32_asset_bare)
+                            for f in _p32_recent_fills
+                        )
+                        if not _p32_tp1_confirmed:
+                            continue  # TP1 oid not found in fills — not triggered yet
+                        # Belt-and-suspenders: size should also have dropped
+                        if _p32_live_sz > _p32_exp_rem * 1.1:
+                            continue  # TP1 fill seen but size hasn't settled — skip this cycle
+                        # TP1 has filled — cancel old SL and place breakeven SL
+                        _p32_entry = float(tr.get('entry_price') or 0)
+                        _p32_old_sl = tr.get('sl_oid')
+                        try:
+                            if _p32_old_sl:
+                                await hyperliquid.cancel_order(_p32_asset, _p32_old_sl)
+                        except Exception as _p32_ce:
+                            add_event(f"P3.2: cancel SL for breakeven failed {_p32_asset}: {_p32_ce}")
+                        _p32_new_sl_oid = None
+                        _p32_rem = max(_p32_live_sz, _p32_exp_rem)
+                        if _p32_entry > 0 and _p32_rem > 0:
+                            try:
+                                _p32_be_res = await hyperliquid.place_stop_loss(
+                                    _p32_asset, _p32_long, _p32_rem, _p32_entry
+                                )
+                                _p32_be_oids = hyperliquid.extract_oids(_p32_be_res)
+                                _p32_new_sl_oid = _p32_be_oids[0] if _p32_be_oids else None
+                            except Exception as _p32_be_err:
+                                add_event(f"P3.2: breakeven SL placement failed {_p32_asset}: {_p32_be_err}")
+                        tr['tp1_filled'] = True
+                        tr['remaining_size'] = _p32_live_sz
+                        if _p32_new_sl_oid:
+                            tr['sl_oid'] = _p32_new_sl_oid
+                            tr['current_sl_price'] = _p32_entry
+                        save_active_trades()
+                        add_event(
+                            f"P3.2 tp1_hit: {_p32_asset} — "
+                            f"rem_sz={_p32_live_sz:.6f} BE_SL={_p32_entry:.4f}"
+                        )
+                        with open(diary_path, "a") as f:
+                            f.write(json.dumps({
+                                "timestamp": datetime.now(timezone.utc).isoformat(),
+                                "asset": _p32_asset,
+                                "action": "tp1_hit",
+                                "remaining_size": round_or_none(_p32_live_sz, 6),
+                                "breakeven_sl": round_or_none(_p32_entry, 6),
+                                "approx_pnl": round_or_none(_p32_live_pos.get('pnl'), 4),
+                            }) + "\n")
+                    except Exception:
+                        continue
+
+            # --- P3.1: Trailing stop management ---
+            # Runs every cycle after market data is fresh.
+            # Never loosens a stop — only moves it tighter when peak advances.
+            if CONFIG.get("trailing_stop_enabled", True):
+                _trail_activate_r = float(CONFIG.get("trail_activate_r") or 1.0)
+                _trail_distance_atr = float(CONFIG.get("trail_distance_atr") or 1.0)
+                for tr in active_trades:
+                    try:
+                        _t_asset = tr.get('asset')
+                        _t_long = tr.get('is_long')
+                        if _t_long is None or not _t_asset:
+                            continue
+                        _t_msec = market_by_asset.get(_t_asset)
+                        if not _t_msec:
+                            continue
+                        _t_cur = float(_t_msec.get('current_price') or 0)
+                        _t_atr = float((_t_msec.get('long_term') or {}).get('atr14') or 0)
+                        if _t_cur <= 0 or _t_atr <= 0:
+                            continue
+                        _t_entry = float(tr.get('entry_price') or 0)
+                        if _t_entry <= 0:
+                            continue
+                        # Initialise tracking fields on first cycle (backward compat)
+                        if 'current_sl_price' not in tr:
+                            tr['current_sl_price'] = tr.get('sl_price')
+                        _t_cur_sl = tr.get('current_sl_price')
+                        if _t_cur_sl is None:
+                            continue
+                        _t_cur_sl = float(_t_cur_sl)
+                        if 'peak_price' not in tr:
+                            tr['peak_price'] = _t_entry
+                        # Update peak — only tighter direction
+                        _t_peak = (
+                            max(float(tr['peak_price']), _t_cur) if _t_long
+                            else min(float(tr['peak_price']), _t_cur)
+                        )
+                        tr['peak_price'] = _t_peak
+                        # Check activation threshold
+                        _t_orig_risk = abs(_t_entry - _t_cur_sl)
+                        if _t_orig_risk <= 0:
+                            continue
+                        _t_profit = (_t_peak - _t_entry) if _t_long else (_t_entry - _t_peak)
+                        if _t_profit < _trail_activate_r * _t_orig_risk:
+                            continue
+                        # Compute candidate trailing SL
+                        _t_new_sl = (
+                            (_t_peak - _trail_distance_atr * _t_atr) if _t_long
+                            else (_t_peak + _trail_distance_atr * _t_atr)
+                        )
+                        # Only move tighter — never loosen
+                        _t_is_tighter = (_t_new_sl > _t_cur_sl) if _t_long else (_t_new_sl < _t_cur_sl)
+                        if not _t_is_tighter:
+                            continue
+                        # Cancel old SL and place tighter trailing SL
+                        _t_old_oid = tr.get('sl_oid')
+                        _t_sl_sz = float(tr.get('remaining_size') or tr.get('amount') or 0)
+                        if _t_sl_sz <= 0:
+                            continue
+                        try:
+                            if _t_old_oid:
+                                await hyperliquid.cancel_order(_t_asset, _t_old_oid)
+                        except Exception as _t_ce:
+                            add_event(f"P3.1: cancel old SL failed {_t_asset}: {_t_ce}")
+                        try:
+                            _t_sl_res = await hyperliquid.place_stop_loss(
+                                _t_asset, _t_long, _t_sl_sz, _t_new_sl
+                            )
+                            _t_new_oids = hyperliquid.extract_oids(_t_sl_res)
+                            _t_new_oid = _t_new_oids[0] if _t_new_oids else None
+                            if _t_new_oid:
+                                _t_was_trailing = tr.get('trailing_active', False)
+                                tr['sl_oid'] = _t_new_oid
+                                tr['current_sl_price'] = _t_new_sl
+                                tr['trailing_active'] = True
+                                save_active_trades()
+                                _t_lbl = "trailing_activated" if not _t_was_trailing else "trailing_updated"
+                                add_event(
+                                    f"P3.1 {_t_lbl}: {_t_asset} SL → {_t_new_sl:.4f} "
+                                    f"(peak={_t_peak:.4f} ATR={_t_atr:.4f} "
+                                    f"R_mult={_t_profit / _t_orig_risk:.2f})"
+                                )
+                                with open(diary_path, "a") as f:
+                                    f.write(json.dumps({
+                                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                                        "asset": _t_asset,
+                                        "action": _t_lbl,
+                                        "new_sl": round_or_none(_t_new_sl, 6),
+                                        "peak_price": round_or_none(_t_peak, 6),
+                                        "atr14_4h": round_or_none(_t_atr, 6),
+                                        "profit_r": round_or_none(_t_profit / _t_orig_risk, 3),
+                                    }) + "\n")
+                            else:
+                                add_event(
+                                    f"P3.1 WARNING: trailing SL for {_t_asset} returned no oid — keeping old"
+                                )
+                        except Exception as _t_pe:
+                            add_event(f"P3.1: place trailing SL failed {_t_asset}: {_t_pe} — keeping old")
+                    except Exception:
+                        continue
+
             for tr in active_trades[:]:
                 try:
                     rules = tr.get("exit_rules") or []
@@ -975,8 +1201,26 @@ def main():
 
                         # --- RISK: Validate trade before execution ---
                         output["current_price"] = current_price
+                        # P3.2: pass ATR14_4h for sl_too_tight gate
+                        output["atr14_4h"] = (
+                            market_by_asset.get(asset, {}).get("long_term", {}).get("atr14")
+                        )
+                        # P3.2: pre-compute tp2_price for MIN_RR check against the far target
+                        _partial_tp_on = CONFIG.get("partial_tp_enabled", True)
+                        if _partial_tp_on and output.get("sl_price") and current_price:
+                            try:
+                                _pre_r = abs(current_price - float(output["sl_price"]))
+                                _pre_tp2_at_r = float(CONFIG.get("tp2_at_r") or 2.5)
+                                if _pre_r > 0:
+                                    output["tp2_price"] = (
+                                        current_price + _pre_tp2_at_r * _pre_r if is_buy
+                                        else current_price - _pre_tp2_at_r * _pre_r
+                                    )
+                            except (TypeError, ValueError):
+                                pass
                         allowed, reason, output = risk_mgr.validate_trade(
-                            output, state, initial_account_value or 0
+                            output, state, initial_account_value or 0,
+                            regime_context=regime_brief_data.get(asset, {})
                         )
                         if not allowed:
                             add_event(f"RISK BLOCKED {asset}: {reason}")
@@ -1201,20 +1445,76 @@ def main():
 
                         trade_log.append({"type": action, "price": current_price, "amount": actual_size, "exit_plan": output["exit_plan"], "filled": filled})
 
-                        # H8: Place TP and SL — only register in active_trades when both succeed
-                        tp_oid = None
+                        # H8 / P3.2: Place TP(s) and SL — only register in active_trades when all succeed
+                        tp_oid = None    # legacy single-TP oid (None when partial TP active)
+                        tp1_oid = None   # P3.2 partial TP1
+                        tp2_oid = None   # P3.2 partial TP2
                         sl_oid = None
                         orders_ok = True
+                        # P3.2: compute TP1/TP2 prices from validated SL + R-multiples
+                        _p3_partial = CONFIG.get("partial_tp_enabled", True)
+                        _p3_tp1_price = None
+                        _p3_tp2_price = None
+                        _p3_tp1_frac = float(CONFIG.get("tp1_fraction") or 0.5)
+                        if _p3_partial and output.get("sl_price") and current_price:
+                            try:
+                                _p3_r = abs(current_price - float(output["sl_price"]))
+                                _p3_tp1_at = float(CONFIG.get("tp1_at_r") or 1.0)
+                                _p3_tp2_at = float(CONFIG.get("tp2_at_r") or 2.5)
+                                if _p3_r > 0:
+                                    _p3_tp1_price = (
+                                        current_price + _p3_tp1_at * _p3_r if is_buy
+                                        else current_price - _p3_tp1_at * _p3_r
+                                    )
+                                    _p3_tp2_price = (
+                                        current_price + _p3_tp2_at * _p3_r if is_buy
+                                        else current_price - _p3_tp2_at * _p3_r
+                                    )
+                                    # LLM tp_price is the "minimum far target" override
+                                    _llm_tp = output.get("tp_price")
+                                    if _llm_tp:
+                                        _llm_tp = float(_llm_tp)
+                                        if is_buy and _llm_tp > _p3_tp2_price:
+                                            _p3_tp2_price = _llm_tp
+                                        elif not is_buy and _llm_tp < _p3_tp2_price:
+                                            _p3_tp2_price = _llm_tp
+                            except (TypeError, ValueError):
+                                _p3_tp1_price = None
+                                _p3_tp2_price = None
                         try:
-                            if output.get("tp_price"):
-                                tp_order = await hyperliquid.place_take_profit(asset, is_buy, actual_size, output["tp_price"])
-                                tp_oids = hyperliquid.extract_oids(tp_order)
-                                tp_oid = tp_oids[0] if tp_oids else None
-                                if tp_oid is None:
-                                    add_event(f"WARNING: TP for {asset} returned no oid — response: {tp_order}")
-                                    orders_ok = False
-                                else:
-                                    add_event(f"TP placed {asset} at {output['tp_price']} (oid={tp_oid})")
+                            if _p3_partial and _p3_tp1_price and _p3_tp2_price:
+                                # Partial TP path: TP1 (fraction) + TP2 (remainder) + SL (full)
+                                _tp1_sz = hyperliquid.round_size(asset, actual_size * _p3_tp1_frac)
+                                _tp2_sz = hyperliquid.round_size(asset, actual_size * (1.0 - _p3_tp1_frac))
+                                if _tp1_sz > 0:
+                                    tp1_res = await hyperliquid.place_take_profit(asset, is_buy, _tp1_sz, _p3_tp1_price)
+                                    _tp1_oids = hyperliquid.extract_oids(tp1_res)
+                                    tp1_oid = _tp1_oids[0] if _tp1_oids else None
+                                    if tp1_oid is None:
+                                        add_event(f"WARNING: TP1 for {asset} returned no oid")
+                                        orders_ok = False
+                                    else:
+                                        add_event(f"TP1 placed {asset} at {_p3_tp1_price:.4f} sz={_tp1_sz} (oid={tp1_oid})")
+                                if _tp2_sz > 0:
+                                    tp2_res = await hyperliquid.place_take_profit(asset, is_buy, _tp2_sz, _p3_tp2_price)
+                                    _tp2_oids = hyperliquid.extract_oids(tp2_res)
+                                    tp2_oid = _tp2_oids[0] if _tp2_oids else None
+                                    if tp2_oid is None:
+                                        add_event(f"WARNING: TP2 for {asset} returned no oid")
+                                        orders_ok = False
+                                    else:
+                                        add_event(f"TP2 placed {asset} at {_p3_tp2_price:.4f} sz={_tp2_sz} (oid={tp2_oid})")
+                            else:
+                                # Legacy single-TP path
+                                if output.get("tp_price"):
+                                    tp_order = await hyperliquid.place_take_profit(asset, is_buy, actual_size, output["tp_price"])
+                                    tp_oids = hyperliquid.extract_oids(tp_order)
+                                    tp_oid = tp_oids[0] if tp_oids else None
+                                    if tp_oid is None:
+                                        add_event(f"WARNING: TP for {asset} returned no oid — response: {tp_order}")
+                                        orders_ok = False
+                                    else:
+                                        add_event(f"TP placed {asset} at {output['tp_price']} (oid={tp_oid})")
                             if output.get("sl_price"):
                                 sl_order = await hyperliquid.place_stop_loss(asset, is_buy, actual_size, output["sl_price"])
                                 sl_oids = hyperliquid.extract_oids(sl_order)
@@ -1263,8 +1563,18 @@ def main():
                                 "is_long": is_buy,
                                 "amount": actual_size,
                                 "entry_price": current_price,
-                                "tp_oid": tp_oid,
+                                "tp_oid": tp_oid,       # legacy single-TP (None when partial TP)
+                                "tp1_oid": tp1_oid,     # P3.2 partial TP1
+                                "tp2_oid": tp2_oid,     # P3.2 partial TP2
+                                "tp1_price": _p3_tp1_price,
+                                "tp2_price": _p3_tp2_price,
+                                "original_size": actual_size,   # P3.2
+                                "remaining_size": actual_size,  # P3.2 updated on TP1 fill
+                                "tp1_filled": False,            # P3.2
                                 "sl_oid": sl_oid,
+                                "current_sl_price": output.get("sl_price"),  # P3.1 tracking
+                                "peak_price": current_price,                  # P3.1 tracking
+                                "trailing_active": False,                     # P3.1
                                 "exit_plan": output["exit_plan"],
                                 "exit_rules": exit_rules,
                                 "entry_thesis": output.get("rationale", "") or "",  # S8
@@ -1387,6 +1697,39 @@ def main():
         initial = 10000
         current = state['balance'] + sum(p.get('pnl', 0) for p in state.get('positions', []))
         return ((current - initial) / initial) * 100 if initial else 0
+
+    def compute_asset_perf(records, asset, window):
+        """Return per-asset win/loss stats from the last `window` closed trades (P3.3).
+
+        Returns None when fewer than 2 records exist for the asset (not enough
+        to compute a meaningful win rate — avoids spurious 0% or 100% displays).
+        """
+        asset_recs = [
+            r for r in records
+            if r.get("asset") == asset and r.get("pnl") is not None
+        ]
+        asset_recs = asset_recs[-window:]
+        if len(asset_recs) < 2:
+            return None
+        wins = [r for r in asset_recs if float(r["pnl"]) > 0]
+        losses = [r for r in asset_recs if float(r["pnl"]) <= 0]
+        win_rate = len(wins) / len(asset_recs)
+        avg_win = sum(float(r["pnl"]) for r in wins) / len(wins) if wins else 0.0
+        avg_loss = sum(float(r["pnl"]) for r in losses) / len(losses) if losses else 0.0
+        net_pnl = sum(float(r["pnl"]) for r in asset_recs)
+        outcomes = []
+        for r in asset_recs[-5:]:
+            outcomes.append("W" if float(r["pnl"]) > 0 else "L")
+        return {
+            "trades": len(asset_recs),
+            "wins": len(wins),
+            "losses": len(losses),
+            "win_rate": round(win_rate, 3),
+            "avg_win": round(avg_win, 4),
+            "avg_loss": round(avg_loss, 4),
+            "net_pnl": round(net_pnl, 4),
+            "last_5_outcomes": outcomes,
+        }
 
     def calculate_sharpe(records):
         """Compute Sharpe from closed-trade records using pnl/margin returns (P2.5).
