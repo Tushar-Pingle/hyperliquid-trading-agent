@@ -450,21 +450,68 @@ def main():
                         tr['_orphan_cycles'] = tr.get('_orphan_cycles', 0) + 1
                         if tr['_orphan_cycles'] >= ORPHAN_CYCLES_REQUIRED:
                             add_event(f"Reconciling stale active trade for {asset} (orphan for {tr['_orphan_cycles']} cycles)")
-                            # P2.5: record close. PnL unknown (filled outside our path —
-                            # SL/TP trigger or manual close); leave pnl=None so the
-                            # Sharpe calc skips it but the entry/exit attempt is logged.
-                            _try_record_close(asset, tr, None, None, "reconcile_close")
+                            # P2.5.1: recover exit price/pnl from exchange fills so
+                            # trade_log records have real numbers instead of null.
+                            rec_exit_price = None
+                            rec_pnl = None
+                            rec_exit_unavailable = False
+                            try:
+                                rec_fills = await hyperliquid.get_recent_fills(limit=100)
+                                opened_ts_ms = 0
+                                if tr.get('opened_at'):
+                                    try:
+                                        opened_ts_ms = int(datetime.fromisoformat(
+                                            str(tr['opened_at']).replace('Z', '+00:00')
+                                        ).timestamp() * 1000)
+                                    except Exception:
+                                        pass
+                                is_long = tr.get('is_long')
+                                close_fills = []
+                                for _f in rec_fills:
+                                    f_coin = _f.get('coin') or _f.get('asset') or ''
+                                    # Match asset name; strip HIP-3 prefix (xyz:CL → CL)
+                                    if f_coin != asset:
+                                        if not (':' in asset and asset.split(':', 1)[1] == f_coin):
+                                            continue
+                                    f_time = int(_f.get('time') or _f.get('timestamp') or 0)
+                                    if f_time < opened_ts_ms:
+                                        continue
+                                    f_is_buy = _f.get('isBuy')
+                                    # Close of a long = sell fill; close of a short = buy fill
+                                    if is_long is True and f_is_buy is True:
+                                        continue
+                                    if is_long is False and f_is_buy is False:
+                                        continue
+                                    close_fills.append(_f)
+                                if close_fills:
+                                    close_fills.sort(key=lambda _f: int(_f.get('time') or 0))
+                                    rec_exit_price = float(close_fills[-1].get('px') or 0) or None
+                                    pnl_parts = [float(_f['closedPnl']) for _f in close_fills
+                                                 if _f.get('closedPnl') is not None]
+                                    rec_pnl = sum(pnl_parts) if pnl_parts else None
+                                else:
+                                    rec_exit_unavailable = True
+                                    add_event(f"No matching close fills found for {asset} reconcile; pnl stays null")
+                            except Exception as _e:
+                                rec_exit_unavailable = True
+                                logging.warning("P2.5.1: fill lookup failed for %s reconcile: %s", asset, _e)
+                            _try_record_close(asset, tr, rec_exit_price, rec_pnl, "reconcile_close")
                             active_trades.remove(tr)
                             save_active_trades()  # H5
+                            _diary_rec = {
+                                "timestamp": datetime.now(timezone.utc).isoformat(),
+                                "asset": asset,
+                                "action": "reconcile_close",
+                                "reason": "no_position_no_orders",
+                                "orphan_cycles": tr['_orphan_cycles'],
+                                "opened_at": tr.get('opened_at'),
+                                "exit_price": rec_exit_price,
+                                "pnl": rec_pnl,
+                            }
+                            if rec_exit_unavailable:
+                                _diary_rec["exit_data_unavailable"] = True
                             with open(diary_path, "a") as f:
-                                f.write(json.dumps({
-                                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                                    "asset": asset,
-                                    "action": "reconcile_close",
-                                    "reason": "no_position_no_orders",
-                                    "orphan_cycles": tr['_orphan_cycles'],
-                                    "opened_at": tr.get('opened_at')
-                                }) + "\n")
+                                f.write(json.dumps(_diary_rec) + "\n")
                         else:
                             add_event(f"Tentative orphan for {asset} (cycle {tr['_orphan_cycles']}/{ORPHAN_CYCLES_REQUIRED}) — deferring reconcile")
                     else:
@@ -703,7 +750,7 @@ def main():
                     return True
 
             try:
-                outputs = agent.decide_trade(args.assets, context)
+                outputs = agent.decide_trade(args.assets, context, has_active_trades=bool(active_trades))
                 if not isinstance(outputs, dict):
                     add_event(f"Invalid output format (expected dict): {outputs}")
                     outputs = {}
@@ -722,7 +769,7 @@ def main():
                 ])
                 context_retry = json.dumps(context_retry_payload, default=json_default)
                 try:
-                    outputs = agent.decide_trade(args.assets, context_retry)
+                    outputs = agent.decide_trade(args.assets, context_retry, has_active_trades=bool(active_trades))
                     if not isinstance(outputs, dict):
                         add_event(f"Retry invalid format: {outputs}")
                         outputs = {}
@@ -1251,6 +1298,7 @@ def main():
                                     "sl_price": output.get("sl_price"),
                                     "sl_oid": sl_oid,
                                     "exit_plan": output.get("exit_plan", ""),
+                                    "exit_rules": output.get("exit_rules") or [],
                                     "rationale": output.get("rationale", ""),
                                     "order_result": str(order),
                                     "opened_at": datetime.now(timezone.utc).isoformat(),

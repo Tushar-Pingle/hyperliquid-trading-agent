@@ -132,6 +132,9 @@ CONFIG = {
     # P2.7 — low-conviction volume gate
     "min_vol_spike_ratio": _get_env("MIN_VOL_SPIKE_RATIO", "0.5"),
 
+    # P2.5.4 — concise mode: shorter LLM output on hold-all cycles
+    "concise_mode": _get_bool("CONCISE_MODE", True),
+
     # Legacy / optional
     "taapi_api_key": _get_env("TAAPI_API_KEY"),
     "openrouter_api_key": _get_env("OPENROUTER_API_KEY"),
