@@ -73,6 +73,9 @@ class RiskManager:
         # P2.7 — low-conviction volume gate
         self.min_vol_spike_ratio = float(CONFIG.get("min_vol_spike_ratio") or 0.5)
 
+        # P3.2 — SL too-tight gate: R must be ≥ this fraction of ATR14_4h
+        self.min_r_as_atr_fraction = float(CONFIG.get("min_r_as_atr_fraction") or 0.3)
+
         # P1.2 — per-asset cooldown
         self.cooldown_bars = int(CONFIG.get("cooldown_bars") or 3)
         self.interval_sec = 300.0  # default 5 m; set by set_interval() after arg parsing
@@ -639,7 +642,12 @@ class RiskManager:
                         enforced_sl, self.mandatory_sl_pct)
         trade = {**trade, "sl_price": enforced_sl}
 
-        # 8. P2.6 — minimum reward:risk ratio
+        # 8. P3.2 — SL too-tight gate (R < MIN_R_AS_ATR_FRACTION × ATR)
+        ok, reason = self.check_sl_too_tight(trade, entry_price, is_buy)
+        if not ok:
+            return False, reason, trade
+
+        # 9. P2.6 — minimum reward:risk ratio (uses tp2_price when partial TP active)
         ok, reason = self.check_min_rr(trade, entry_price, is_buy)
         if not ok:
             return False, reason, trade
@@ -658,7 +666,8 @@ class RiskManager:
         the existing behaviour where the LLM can leave a position open-ended.
         """
         try:
-            tp_raw = trade.get("tp_price")
+            # P3.2: when partial TP is active, validate against the further target (TP2)
+            tp_raw = trade.get("tp2_price") or trade.get("tp_price")
             sl_raw = trade.get("sl_price")
         except Exception:
             return True, ""
@@ -690,6 +699,36 @@ class RiskManager:
                 f"min_rr_not_met: {rr:.2f} < {self.min_rr} "
                 f"(entry={entry:.6f} tp={tp:.6f} sl={sl:.6f})"
             )
+        return True, ""
+
+    def check_sl_too_tight(self, trade: dict, entry_price: float,
+                           is_buy: bool) -> tuple[bool, str]:
+        """Reject entries where R < MIN_R_AS_ATR_FRACTION × ATR14_4h (P3.2).
+
+        Prevents the partial-TP system from placing TP1/TP2 so close to entry
+        that spread or noise fills them immediately. Skipped when ATR is absent.
+        """
+        try:
+            atr = trade.get("atr14_4h")
+            if atr is None:
+                return True, ""  # no ATR data — skip rather than block
+            atr = float(atr)
+            if atr <= 0:
+                return True, ""
+            sl_raw = trade.get("sl_price")
+            if sl_raw is None:
+                return True, ""  # mandatory SL not yet enforced — skip
+            sl = float(sl_raw)
+            entry = float(entry_price)
+            R = abs(entry - sl)
+            min_r = self.min_r_as_atr_fraction * atr
+            if R < min_r:
+                return False, (
+                    f"sl_too_tight: R={R:.6f} < {self.min_r_as_atr_fraction}×ATR={min_r:.6f} "
+                    f"(atr14_4h={atr:.6f})"
+                )
+        except (TypeError, ValueError):
+            pass
         return True, ""
 
     def get_risk_summary(self) -> dict:
