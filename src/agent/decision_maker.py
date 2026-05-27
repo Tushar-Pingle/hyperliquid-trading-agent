@@ -55,10 +55,20 @@ class TradingAgent:
             "    - Fade range extremes: long near support, short near resistance.\n"
             "    - Use tighter TPs (target the opposite range edge, not a trend extension).\n"
             "    - AVOID mid-range entries — the edge only exists near the boundary.\n\n"
-            "  regime = 'volatile':\n"
-            "    - DEFAULT TO HOLD. Volatile regime = stand aside.\n"
-            "    - Only enter with EXCEPTIONAL conviction AND a clear catalyst.\n"
-            "    - The risk manager will hard-block entries in volatile regime when REGIME_GATE_VOLATILE=true.\n\n"
+            + (
+                "  regime = 'volatile':\n"
+                "    - DEFAULT TO HOLD. Volatile regime = stand aside.\n"
+                "    - Only enter with EXCEPTIONAL conviction AND a clear catalyst.\n"
+                "    - The risk manager HARD-BLOCKS all entries in volatile regime (REGIME_GATE_VOLATILE=true).\n\n"
+                if CONFIG.get("regime_gate_volatile", True) else
+                "  regime = 'volatile':\n"
+                "    - Reduce position size by 50% and require EXCEPTIONAL conviction: clear catalyst,\n"
+                "      structural alignment on the 4h, AND strong volume confirmation.\n"
+                "    - The hard code gate is disabled (REGIME_GATE_VOLATILE=false) — you have discretion,\n"
+                "      but volatile regime means elevated risk of violent whipsaws. Size down accordingly.\n"
+                "    - If conviction is moderate, HOLD. Only enter when the setup is unambiguous.\n\n"
+            )
+            +
             "  regime = null / stale / 'unknown':\n"
             "    - Trade with normal caution; flag the absence in your reasoning.\n\n"
             "TP/SL placement — follow this exact sequence every time you consider an entry:\n"
